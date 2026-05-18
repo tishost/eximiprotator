@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.5.0
+#  Version : 1.6.0
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.6.0"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -249,7 +249,13 @@ update_current_ip() {
     log "IP updated: $selected_ip ptr=$ptr_host slot=$idx/$active"
 }
 
-# Updates /etc/mailips and /etc/mailhello for all cPanel domains
+# Updates /etc/mailips and /etc/mailhello using wildcard catch-all.
+# Format:
+#   dedicated.com=2.2.2.2   ← preserved (non-rotation dedicated IP)
+#   *=1.1.1.1               ← catch-all for every other domain
+#
+# cPanel Exim uses lsearch*@ which matches wildcard entries,
+# so explicit domain entries take precedence over *.
 _update_cpanel_mailfiles() {
     local new_ip="$1"
     local new_helo="$2"
@@ -257,12 +263,8 @@ _update_cpanel_mailfiles() {
 
     local MAILIPS="/etc/mailips"
     local MAILHELLO="/etc/mailhello"
-    local LOCALDOMAINS="/etc/localdomains"
 
-    # Need localdomains to know which domains exist
-    [[ ! -f "$LOCALDOMAINS" ]] && return 0
-
-    # Backup once per day
+    # Daily backup
     local bak_date
     bak_date=$(date '+%Y%m%d')
     [[ ! -f "${MAILIPS}.bak.${bak_date}" && -f "$MAILIPS" ]] && \
@@ -270,41 +272,50 @@ _update_cpanel_mailfiles() {
     [[ ! -f "${MAILHELLO}.bak.${bak_date}" && -f "$MAILHELLO" ]] && \
         cp "$MAILHELLO" "${MAILHELLO}.bak.${bak_date}"
 
-    # Read dedicated IPs — domains that already have a non-rotation IP
-    # (entries in /etc/mailips that are NOT one of our rotation IPs)
-    declare -A dedicated
-    if [[ -f "$MAILIPS" ]]; then
-        while IFS='=' read -r dom ip; do
-            [[ -z "$dom" || "$dom" == \#* ]] && continue
-            # Check if this IP is one of our rotation IPs
-            if ! grep -q "^${ip}|" "$CONFIG_FILE" 2>/dev/null; then
-                dedicated["$dom"]=1   # has dedicated non-rotation IP → skip
-            fi
-        done < "$MAILIPS"
-    fi
-
-    # Build new mailips and mailhello from localdomains
     local tmp_ips tmp_helo
     tmp_ips=$(mktemp)
     tmp_helo=$(mktemp)
 
-    echo "# Managed by eximip — $(date)" > "$tmp_ips"
-    echo "# Managed by eximip — $(date)" > "$tmp_helo"
+    {
+        echo "# Managed by eximip v${VERSION} — $(date)"
+        echo "# Wildcard entry: all domains use rotation IP by default."
+        echo "# Dedicated overrides (non-rotation IPs) are listed above *"
+        echo ""
 
-    local updated=0
-    while read -r domain; do
-        [[ -z "$domain" || "$domain" == \#* ]] && continue
-        # Skip domains with dedicated IPs
-        if [[ -n "${dedicated[$domain]+_}" ]]; then
-            # Preserve their existing entry
-            grep "^${domain}=" "$MAILIPS" 2>/dev/null >> "$tmp_ips" || true
-            grep "^${domain}=" "$MAILHELLO" 2>/dev/null >> "$tmp_helo" || true
-            continue
+        # Preserve dedicated IP entries (IPs NOT in our rotation pool)
+        if [[ -f "$MAILIPS" ]]; then
+            while IFS='=' read -r dom ip; do
+                [[ -z "$dom" || "$dom" == \#* || "$dom" == "*" ]] && continue
+                ip="${ip%%[[:space:]]*}"
+                # Keep only if IP is NOT one of our rotation IPs
+                if ! grep -q "^${ip}|" "$CONFIG_FILE" 2>/dev/null; then
+                    echo "${dom}=${ip}"
+                fi
+            done < "$MAILIPS"
         fi
-        echo "${domain}=${new_ip}"   >> "$tmp_ips"
-        [[ -n "$new_helo" ]] && echo "${domain}=${new_helo}" >> "$tmp_helo"
-        updated=$((updated+1))
-    done < "$LOCALDOMAINS"
+
+        # Wildcard catch-all
+        echo "*=${new_ip}"
+    } > "$tmp_ips"
+
+    {
+        echo "# Managed by eximip v${VERSION} — $(date)"
+        echo ""
+
+        # Preserve dedicated HELO entries
+        if [[ -f "$MAILHELLO" ]]; then
+            while IFS='=' read -r dom helo; do
+                [[ -z "$dom" || "$dom" == \#* || "$dom" == "*" ]] && continue
+                # Keep only if corresponding mailips entry is dedicated
+                if grep -qP "^${dom}=" "$tmp_ips" 2>/dev/null; then
+                    echo "${dom}=${helo}"
+                fi
+            done < "$MAILHELLO"
+        fi
+
+        # Wildcard catch-all
+        [[ -n "$new_helo" ]] && echo "*=${new_helo}"
+    } > "$tmp_helo"
 
     # Atomic replace
     chmod 644 "$tmp_ips" "$tmp_helo"
@@ -312,11 +323,10 @@ _update_cpanel_mailfiles() {
     mv "$tmp_helo" "$MAILHELLO"
 
     [[ "$silent" != "silent" ]] && \
-        echo -e "${GREEN}✓ /etc/mailips updated   : $updated domains → $new_ip${NC}" && \
-        echo -e "${GREEN}✓ /etc/mailhello updated : $updated domains → ${new_helo:-$new_ip}${NC}"
+        echo -e "${GREEN}✓ /etc/mailips   : *=${new_ip}${NC}" && \
+        echo -e "${GREEN}✓ /etc/mailhello : *=${new_helo:-$new_ip}${NC}"
 
-    log "mailips/mailhello updated: $updated domains → $new_ip helo=$new_helo"
-    unset dedicated
+    log "mailips/mailhello updated: *=$new_ip helo=$new_helo"
 }
 
 # Called by cron every hour — auto-sync then rotate
