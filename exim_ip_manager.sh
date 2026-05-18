@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.4.0
+#  Version : 1.5.0
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -210,11 +210,12 @@ list_ips() {
 # One-time WHM setup required (see: eximip setup-guide)
 
 update_current_ip() {
+    local silent="${1:-}"
     local active
     active=$(ip_count)
 
     if [[ $active -eq 0 ]]; then
-        echo -e "${RED}No active IPs configured.${NC}"
+        [[ "$silent" != "silent" ]] && echo -e "${RED}No active IPs configured.${NC}"
         return 1
     fi
 
@@ -225,15 +226,97 @@ update_current_ip() {
 
     [[ -z "$selected_ip" ]] && die "Could not determine IP for slot $idx"
 
-    # Atomic write — no partial reads by Exim
+    # ── 1. /etc/exim_current_ip (Exim transport readfile) ────────
     local tmp
     tmp=$(mktemp /etc/exim_current_ip.XXXXXX)
     echo -n "$selected_ip" > "$tmp"
     chmod 644 "$tmp"
     mv "$tmp" "$CURRENT_IP_FILE"
 
-    echo -e "${GREEN}✓ Current sending IP set to: $selected_ip${NC}"
-    log "IP updated to: $selected_ip (slot $idx of $active)"
+    # ── 2. /etc/mailips — cPanel native per-domain IP routing ────
+    # Get PTR hostname for HELO
+    local ptr_host=""
+    ptr_host=$(dig +short -x "$selected_ip" 2>/dev/null | sed 's/\.$//' || true)
+    [[ -z "$ptr_host" ]] && ptr_host=$(hostname -f 2>/dev/null || true)
+
+    _update_cpanel_mailfiles "$selected_ip" "$ptr_host" "$silent"
+
+    [[ "$silent" != "silent" ]] && \
+        echo -e "${GREEN}✓ Sending IP set to: $selected_ip${NC}" && \
+        [[ -n "$ptr_host" ]] && \
+        echo -e "${GREEN}✓ HELO hostname   : $ptr_host${NC}"
+
+    log "IP updated: $selected_ip ptr=$ptr_host slot=$idx/$active"
+}
+
+# Updates /etc/mailips and /etc/mailhello for all cPanel domains
+_update_cpanel_mailfiles() {
+    local new_ip="$1"
+    local new_helo="$2"
+    local silent="${3:-}"
+
+    local MAILIPS="/etc/mailips"
+    local MAILHELLO="/etc/mailhello"
+    local LOCALDOMAINS="/etc/localdomains"
+
+    # Need localdomains to know which domains exist
+    [[ ! -f "$LOCALDOMAINS" ]] && return 0
+
+    # Backup once per day
+    local bak_date
+    bak_date=$(date '+%Y%m%d')
+    [[ ! -f "${MAILIPS}.bak.${bak_date}" && -f "$MAILIPS" ]] && \
+        cp "$MAILIPS" "${MAILIPS}.bak.${bak_date}"
+    [[ ! -f "${MAILHELLO}.bak.${bak_date}" && -f "$MAILHELLO" ]] && \
+        cp "$MAILHELLO" "${MAILHELLO}.bak.${bak_date}"
+
+    # Read dedicated IPs — domains that already have a non-rotation IP
+    # (entries in /etc/mailips that are NOT one of our rotation IPs)
+    declare -A dedicated
+    if [[ -f "$MAILIPS" ]]; then
+        while IFS='=' read -r dom ip; do
+            [[ -z "$dom" || "$dom" == \#* ]] && continue
+            # Check if this IP is one of our rotation IPs
+            if ! grep -q "^${ip}|" "$CONFIG_FILE" 2>/dev/null; then
+                dedicated["$dom"]=1   # has dedicated non-rotation IP → skip
+            fi
+        done < "$MAILIPS"
+    fi
+
+    # Build new mailips and mailhello from localdomains
+    local tmp_ips tmp_helo
+    tmp_ips=$(mktemp)
+    tmp_helo=$(mktemp)
+
+    echo "# Managed by eximip — $(date)" > "$tmp_ips"
+    echo "# Managed by eximip — $(date)" > "$tmp_helo"
+
+    local updated=0
+    while read -r domain; do
+        [[ -z "$domain" || "$domain" == \#* ]] && continue
+        # Skip domains with dedicated IPs
+        if [[ -n "${dedicated[$domain]+_}" ]]; then
+            # Preserve their existing entry
+            grep "^${domain}=" "$MAILIPS" 2>/dev/null >> "$tmp_ips" || true
+            grep "^${domain}=" "$MAILHELLO" 2>/dev/null >> "$tmp_helo" || true
+            continue
+        fi
+        echo "${domain}=${new_ip}"   >> "$tmp_ips"
+        [[ -n "$new_helo" ]] && echo "${domain}=${new_helo}" >> "$tmp_helo"
+        updated=$((updated+1))
+    done < "$LOCALDOMAINS"
+
+    # Atomic replace
+    chmod 644 "$tmp_ips" "$tmp_helo"
+    mv "$tmp_ips"  "$MAILIPS"
+    mv "$tmp_helo" "$MAILHELLO"
+
+    [[ "$silent" != "silent" ]] && \
+        echo -e "${GREEN}✓ /etc/mailips updated   : $updated domains → $new_ip${NC}" && \
+        echo -e "${GREEN}✓ /etc/mailhello updated : $updated domains → ${new_helo:-$new_ip}${NC}"
+
+    log "mailips/mailhello updated: $updated domains → $new_ip helo=$new_helo"
+    unset dedicated
 }
 
 # Called by cron every hour — auto-sync then rotate
@@ -242,7 +325,7 @@ cron_rotate() {
     local active
     active=$(ip_count)
     [[ $active -eq 0 ]] && log "cron_rotate: no active IPs, skipping" && exit 0
-    update_current_ip
+    update_current_ip silent
 }
 
 # ── auto-sync server IPs ──────────────────────────────────────
@@ -328,39 +411,57 @@ sync_server_ips() {
 
 show_setup_guide() {
     print_header
-    echo -e "${BLUE}=== One-Time WHM Setup Guide ===${NC}\n"
-    echo -e "This script uses a FILE-BASED approach:"
-    echo -e "  • /etc/exim_current_ip holds the active IP"
-    echo -e "  • Exim reads it dynamically — ${GREEN}no restart when IP changes${NC}"
-    echo -e "  • Cron updates the file every hour\n"
+    echo -e "${BLUE}=== WHM/cPanel Setup Guide ===${NC}\n"
 
-    echo -e "${YELLOW}STEP 1 — WHM Exim Configuration Manager${NC}"
-    echo -e "  1. Log into WHM"
-    echo -e "  2. Go to: Service Configuration → Exim Configuration Manager"
-    echo -e "  3. Click: Advanced Editor\n"
+    echo -e "${CYAN}এই system দুটো পদ্ধতিতে IP rotation করে:${NC}"
+    echo -e "  1. ${GREEN}/etc/mailips + /etc/mailhello${NC} — cPanel native (primary)"
+    echo -e "     প্রতি ঘণ্টায় সব domain এর outgoing IP আপডেট হয়"
+    echo -e "     কোনো WHM config change লাগে না\n"
+    echo -e "  2. ${GREEN}/etc/exim_current_ip${NC} — Exim transport readfile (backup)"
+    echo -e "     WHM এ একবার interface line যোগ করতে হয়\n"
 
-    echo -e "${YELLOW}STEP 2 — Find the remote_smtp transport${NC}"
-    echo -e "  Search for:   remote_smtp:"
-    echo -e "  It looks like:"
-    echo -e "    remote_smtp:"
-    echo -e "      driver = smtp"
-    echo -e "      ...\n"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}REQUIRED — Cron install (সবার জন্য)${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  প্রতি ঘণ্টায় /etc/mailips ও /etc/mailhello আপডেট করে।"
+    echo -e "  Run: ${GREEN}eximip install-cron${NC}\n"
 
-    echo -e "${YELLOW}STEP 3 — Add the interface line${NC}"
-    echo -e "  Add this line inside the remote_smtp transport block:"
-    echo -e "  ${GREEN}  interface = \${readfile{/etc/exim_current_ip}{}}${NC}\n"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}OPTIONAL — WHM Exim transport (extra safety)${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "  এটা না করলেও চলবে। করলে fallback হিসেবে কাজ করে।\n"
+    echo -e "  1. WHM → Service Configuration → Exim Configuration Manager"
+    echo -e "     → Advanced Editor\n"
+    echo -e "  2. ${CYAN}remote_smtp:${NC} transport খোঁজো\n"
+    echo -e "  3. ${CYAN}driver = smtp${NC} এর নিচে এই line যোগ করো:"
+    echo -e "     ${GREEN}  interface = \${readfile{/etc/exim_current_ip}{}}${NC}\n"
+    echo -e "  4. Save → WHM automatically rebuild + restart করবে\n"
 
-    echo -e "${YELLOW}STEP 4 — Save & rebuild${NC}"
-    echo -e "  Click Save. WHM will rebuild and restart Exim automatically.\n"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}cPanel /etc/mailips কীভাবে কাজ করে${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    cat << 'INFO'
 
-    echo -e "${YELLOW}STEP 5 — Install the hourly cron${NC}"
-    echo -e "  Run: ${CYAN}eximip install-cron${NC}\n"
+  /etc/mailips  → domain=IP   (কোন domain কোন IP থেকে mail পাঠাবে)
+  /etc/mailhello → domain=hostname (SMTP EHLO/HELO hostname)
 
-    echo -e "${YELLOW}STEP 6 — Add your IPs${NC}"
-    echo -e "  Run: ${CYAN}eximip add${NC}\n"
+  Entry না থাকলে → cPanel main server IP থেকে mail যায়।
+  Entry থাকলে   → সেই নির্দিষ্ট IP থেকে mail যায়।
 
-    echo -e "${GREEN}After setup, IP switches every hour with zero downtime.${NC}"
-    echo -e "${GREEN}If an IP is blacklisted, disable it with: eximip menu → option 4${NC}"
+  এই system প্রতি ঘণ্টায় এই দুটো file আপডেট করে:
+  • সব cPanel domain → rotation এর current IP
+  • Dedicated IP থাকা domains → touch করা হয় না
+
+INFO
+    echo -e "  ${CYAN}verify করতে:${NC}"
+    echo -e "  cat /etc/mailips   → সব domain এর IP দেখাবে"
+    echo -e "  cat /etc/mailhello → সব domain এর HELO দেখাবে\n"
+
+    echo -e "${GREEN}Setup শেষ করতে:${NC}"
+    echo -e "  1. ${YELLOW}eximip sync${NC}         ← server IPs auto-detect"
+    echo -e "  2. ${YELLOW}eximip install-cron${NC} ← hourly rotation চালু করো"
+    echo -e "  3. ${YELLOW}eximip update-ip${NC}    ← এখনই apply করো"
+    echo -e "  4. ${YELLOW}eximip ip-check${NC}     ← সব IP verify করো\n"
 }
 
 # ── cron installer ───────────────────────────────────────────
