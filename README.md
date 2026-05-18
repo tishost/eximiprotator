@@ -13,18 +13,33 @@ WHM/cPanel server এ multiple IP থেকে email rotation manage করা�
 - Safe cPanel IP add guide (warm-up schedule সহ)
 - Existing cPanel accounts এ কোনো প্রভাব নেই
 
-## Quick Start
+## Installation
 
 ```bash
-# Server এ upload করো
-scp exim_ip_manager.sh install.sh root@YOUR_SERVER:/tmp/
+# SSH দিয়ে server এ ঢোকো (root)
+ssh root@YOUR_SERVER_IP
 
-# Install
-ssh root@YOUR_SERVER
-cd /tmp && chmod +x install.sh && ./install.sh
+# Dependencies install করো
+yum install -y git bind-utils nmap-ncat
+
+# Repository clone করো
+git clone https://github.com/tishost/eximiprotator.git /usr/local/eximiprotator
+
+# Install করো
+cd /usr/local/eximiprotator
+chmod +x install.sh
+./install.sh
 
 # চালাও
 eximip
+```
+
+### Update করতে
+
+```bash
+cd /usr/local/eximiprotator
+git pull
+./install.sh
 ```
 
 ## Usage

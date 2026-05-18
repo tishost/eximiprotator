@@ -54,23 +54,46 @@
 
 ## Installation
 
+### Step 1 — Server এ SSH করো
 ```bash
-# ১. ফাইল server এ আপলোড করো (local machine থেকে)
-scp exim_ip_manager.sh install.sh root@YOUR_SERVER_IP:/tmp/
-
-# ২. Server এ SSH করো
 ssh root@YOUR_SERVER_IP
+```
 
-# ৩. Install করো
-cd /tmp
-chmod +x install.sh exim_ip_manager.sh
+### Step 2 — Dependencies install করো
+```bash
+yum install -y git bind-utils nmap-ncat
+```
+
+### Step 3 — Repository clone করো
+```bash
+git clone https://github.com/tishost/eximiprotator.git /usr/local/eximiprotator
+```
+
+### Step 4 — Install করো
+```bash
+cd /usr/local/eximiprotator
+chmod +x install.sh
 ./install.sh
+```
 
-# ৪. এখন যেকোনো জায়গা থেকে চালাও
+### Step 5 — চালাও
+```bash
 eximip
 ```
 
 Install হলে `eximip` command সব জায়গা থেকে কাজ করবে।
+
+---
+
+### Update করতে
+
+নতুন version আসলে:
+```bash
+cd /usr/local/eximiprotator
+git pull
+./install.sh
+eximip --version
+```
 
 ---
 
