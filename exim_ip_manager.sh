@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.1.0
+#  Version : 1.2.0
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -389,6 +389,118 @@ remove_cron() {
     crontab -l 2>/dev/null | grep -v "exim_ip_manager" | crontab - || true
     echo -e "${GREEN}✓ Cron removed.${NC}"
     log "Cron removed"
+}
+
+# ── uninstall ────────────────────────────────────────────────
+
+uninstall() {
+    print_header
+    echo -e "${RED}=== Uninstall Exim IP Rotation Manager ===${NC}\n"
+    echo -e "এই কাজগুলো হবে:\n"
+    echo -e "  ${RED}✗${NC} Exim config থেকে interface line সরানো হবে"
+    echo -e "  ${RED}✗${NC} Exim rebuild ও restart হবে (mail চলতে থাকবে — main IP এ)"
+    echo -e "  ${RED}✗${NC} Hourly cron বন্ধ হবে"
+    echo -e "  ${RED}✗${NC} /etc/exim_current_ip মুছে যাবে"
+    echo -e "  ${RED}✗${NC} /usr/local/bin/eximip মুছে যাবে"
+    echo -e "  ${RED}✗${NC} /usr/local/eximiprotator/ মুছে যাবে"
+    echo -e "  ${YELLOW}✓${NC} /etc/exim_rotation.conf রাখা হবে (IP list backup)"
+    echo -e "  ${YELLOW}✓${NC} /var/log/exim_ip_rotation.log রাখা হবে\n"
+
+    read -rp "$(echo -e "${RED}নিশ্চিত? এটা undo করা যাবে না। [yes/N]: ${NC}")" confirm
+    [[ "$confirm" != "yes" ]] && echo -e "${YELLOW}Cancelled.${NC}" && return 0
+
+    echo ""
+
+    # ── Step 1: Exim config থেকে interface line সরাও ──────────
+    echo -e "${YELLOW}[1/5] Exim config থেকে interface line সরাচ্ছি...${NC}"
+
+    local EXIM_CONF="/etc/exim.conf"
+    local removed_exim=0
+
+    if [[ -f "$EXIM_CONF" ]]; then
+        # Backup before touching
+        cp "$EXIM_CONF" "${EXIM_CONF}.pre-eximip-uninstall.$(date +%Y%m%d%H%M%S)"
+
+        if grep -q 'readfile.*exim_current_ip' "$EXIM_CONF"; then
+            sed -i '/interface.*readfile.*exim_current_ip/d' "$EXIM_CONF"
+            echo -e "  ${GREEN}✓ interface line removed from $EXIM_CONF${NC}"
+            removed_exim=1
+        else
+            echo -e "  ${CYAN}ℹ interface line not found in $EXIM_CONF (may be in WHM template)${NC}"
+        fi
+    fi
+
+    # Also check exim.conf.local
+    local EXIM_LOCAL="/etc/exim.conf.local"
+    if [[ -f "$EXIM_LOCAL" ]] && grep -q 'readfile.*exim_current_ip' "$EXIM_LOCAL"; then
+        sed -i '/interface.*readfile.*exim_current_ip/d' "$EXIM_LOCAL"
+        echo -e "  ${GREEN}✓ interface line removed from $EXIM_LOCAL${NC}"
+        removed_exim=1
+    fi
+
+    if [[ $removed_exim -eq 0 ]]; then
+        echo -e "  ${YELLOW}⚠ interface line not found automatically.${NC}"
+        echo -e "  ${YELLOW}  WHM → Exim Configuration Manager → Advanced Editor${NC}"
+        echo -e "  ${YELLOW}  remote_smtp transport থেকে এই line টা manually সরাও:${NC}"
+        echo -e "  ${RED}    interface = \${readfile{/etc/exim_current_ip}{}}${NC}"
+    fi
+
+    # ── Step 2: Exim rebuild + restart ─────────────────────────
+    echo -e "${YELLOW}[2/5] Exim rebuild ও restart করছি...${NC}"
+
+    if command -v /scripts/buildeximconf &>/dev/null; then
+        /scripts/buildeximconf > /dev/null 2>&1 && \
+            echo -e "  ${GREEN}✓ Exim config rebuilt via WHM${NC}" || \
+            echo -e "  ${YELLOW}⚠ buildeximconf failed — try: /scripts/restartsrv_exim${NC}"
+
+        /scripts/restartsrv_exim > /dev/null 2>&1 && \
+            echo -e "  ${GREEN}✓ Exim restarted — now sending from main IP${NC}" || \
+            echo -e "  ${YELLOW}⚠ Exim restart failed — run: service exim restart${NC}"
+    else
+        service exim restart > /dev/null 2>&1 && \
+            echo -e "  ${GREEN}✓ Exim restarted${NC}" || \
+            echo -e "  ${YELLOW}⚠ Could not restart Exim — run manually: service exim restart${NC}"
+    fi
+
+    # ── Step 3: Cron সরাও ──────────────────────────────────────
+    echo -e "${YELLOW}[3/5] Cron সরাচ্ছি...${NC}"
+    crontab -l 2>/dev/null | grep -v "exim_ip_manager" | crontab - || true
+    echo -e "  ${GREEN}✓ Cron removed${NC}"
+
+    # logrotate সরাও
+    rm -f /etc/logrotate.d/exim-ip-rotation
+    echo -e "  ${GREEN}✓ Logrotate config removed${NC}"
+
+    # ── Step 4: Runtime files সরাও ────────────────────────────
+    echo -e "${YELLOW}[4/5] Runtime files সরাচ্ছি...${NC}"
+    rm -f "$CURRENT_IP_FILE" && echo -e "  ${GREEN}✓ /etc/exim_current_ip removed${NC}"
+    rm -f /usr/local/bin/eximip && echo -e "  ${GREEN}✓ /usr/local/bin/eximip removed${NC}"
+
+    # ── Step 5: Install directory সরাও ────────────────────────
+    echo -e "${YELLOW}[5/5] Install directory সরাচ্ছি...${NC}"
+    local install_dirs=("/usr/local/eximiprotator" "/usr/local/exim-ip-manager")
+    for d in "${install_dirs[@]}"; do
+        if [[ -d "$d" ]]; then
+            rm -rf "$d"
+            echo -e "  ${GREEN}✓ $d removed${NC}"
+        fi
+    done
+
+    # ── Done ───────────────────────────────────────────────────
+    echo ""
+    echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+    echo -e "${GREEN}  Uninstall complete.${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+    echo -e "  Mail এখন main server IP থেকে যাবে (Exim default)।"
+    echo -e "  IP list backup: ${YELLOW}/etc/exim_rotation.conf${NC}"
+    echo -e "  Exim config backup: ${YELLOW}${EXIM_CONF}.pre-eximip-uninstall.*${NC}"
+
+    if [[ $removed_exim -eq 0 ]]; then
+        echo ""
+        echo -e "  ${RED}⚠ WHM Advanced Editor থেকে interface line manually সরাও!${NC}"
+        echo -e "  ${RED}  না সরালে Exim /etc/exim_current_ip খুঁজবে — mail যাবে না।${NC}"
+    fi
+    echo ""
 }
 
 # ── status & monitoring ──────────────────────────────────────
@@ -1324,6 +1436,7 @@ main_menu() {
         echo -e "  ${GREEN}g)${NC} cPanel IP add guide (safe step-by-step)"
         echo -e "  ${CYAN}s)${NC} WHM setup guide (read first!)"
         echo -e "  ${CYAN}c)${NC} Install hourly cron"
+        echo -e "  ${RED}u)${NC} Uninstall (removes everything, resets Exim)"
         echo -e "  ${RED}0)${NC} Exit"
         echo ""
         read -rp "Select: " choice
@@ -1346,6 +1459,7 @@ main_menu() {
             g) show_ip_add_guide ;;
             s) show_setup_guide ;;
             c) install_cron ;;
+            u) uninstall ;;
             0) echo -e "\n${GREEN}Done.${NC}\n"; exit 0 ;;
             *) echo -e "${RED}Invalid.${NC}" ;;
         esac
@@ -1380,6 +1494,7 @@ case "${1:-menu}" in
     deliverability)        check_deliverability ;;
     deliverability-fails)  check_deliverability fails ;;
     ip-add-guide)          show_ip_add_guide ;;
+    uninstall)             uninstall ;;
     *)
         echo "Usage: $0 [menu|add|remove|list|status|update-ip|blacklist|dns|logs|stats|install-cron|setup-guide|deliverability|deliverability-fails|ip-add-guide]"
         exit 1
