@@ -77,9 +77,16 @@ echo -e "${GREEN}✓ Command     : eximip  (available system-wide)${NC}"
 echo -e "${GREEN}✓ Version     : $VERSION${NC}"
 echo -e "${GREEN}✓ Log file    : /var/log/exim_ip_rotation.log${NC}"
 echo ""
+# ── auto-sync server IPs on first install ────────────────────
+if [[ ! -f /etc/exim_rotation.conf ]] || \
+   ! grep -q '|' /etc/exim_rotation.conf 2>/dev/null; then
+    echo -e "${YELLOW}Auto-detecting server IPs...${NC}"
+    "$MAIN_SCRIPT" sync 2>/dev/null || true
+fi
+
 echo -e "${CYAN}Next steps:${NC}"
 echo -e "  1. ${YELLOW}eximip setup-guide${NC}   ← WHM এ একবারের setup দেখো"
-echo -e "  2. ${YELLOW}eximip add${NC}            ← প্রথম IP যোগ করো"
+echo -e "  2. ${YELLOW}eximip list${NC}           ← Auto-detected IPs দেখো"
 echo -e "  3. ${YELLOW}eximip install-cron${NC}   ← Hourly rotation চালু করো"
 echo ""
 echo -e "  Full guide : ${CYAN}${INSTALL_DIR}/USERGUIDE.md${NC}"

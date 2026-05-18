@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.0.0
+#  Version : 1.1.0
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -236,12 +236,92 @@ update_current_ip() {
     log "IP updated to: $selected_ip (slot $idx of $active)"
 }
 
-# Called by cron every hour — no restart, no downtime
+# Called by cron every hour — auto-sync then rotate
 cron_rotate() {
+    sync_server_ips silent
     local active
     active=$(ip_count)
     [[ $active -eq 0 ]] && log "cron_rotate: no active IPs, skipping" && exit 0
     update_current_ip
+}
+
+# ── auto-sync server IPs ──────────────────────────────────────
+# Scans all IPs on the server and adds any missing ones to the
+# rotation config automatically. Existing IPs are never modified.
+
+sync_server_ips() {
+    local silent="${1:-}"  # pass "silent" to suppress output
+
+    [[ "$silent" != "silent" ]] && print_header
+    [[ "$silent" != "silent" ]] && echo -e "${BLUE}=== Auto-Sync Server IPs ===${NC}\n"
+
+    # Get all routable IPs on server (skip loopback + link-local)
+    local server_ips=()
+    while read -r sip; do
+        server_ips+=("$sip")
+    done < <(ip addr show 2>/dev/null \
+        | grep 'inet ' \
+        | awk '{print $2}' \
+        | cut -d/ -f1 \
+        | grep -vE '^(127\.|169\.254\.)' \
+        | sort -u)
+
+    if [[ ${#server_ips[@]} -eq 0 ]]; then
+        [[ "$silent" != "silent" ]] && echo -e "${RED}No IPs found on server.${NC}"
+        return 1
+    fi
+
+    # Identify main server IP (default route)
+    local main_ip=""
+    main_ip=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
+
+    local added=0 skipped=0
+
+    for sip in "${server_ips[@]}"; do
+        # Already in config? Skip
+        if grep -q "^${sip}|" "$CONFIG_FILE" 2>/dev/null; then
+            skipped=$((skipped+1))
+            [[ "$silent" != "silent" ]] && \
+                echo -e "  ${CYAN}already in pool${NC}  $sip"
+            continue
+        fi
+
+        # Build label
+        local label
+        if [[ "$sip" == "$main_ip" ]]; then
+            label="Main-IP"
+        else
+            label="IP-$((added + skipped + 1))"
+        fi
+
+        echo "${sip}|${label}|1000|1" >> "$CONFIG_FILE"
+        added=$((added+1))
+        log "Auto-synced IP: $sip label=$label"
+
+        [[ "$silent" != "silent" ]] && \
+            echo -e "  ${GREEN}✓ added${NC}           $sip  ($label)"
+    done
+
+    if [[ "$silent" != "silent" ]]; then
+        echo ""
+        echo -e "  Total on server : ${#server_ips[@]}"
+        echo -e "  Added           : ${GREEN}${added}${NC}"
+        echo -e "  Already existed : ${skipped}"
+
+        if [[ $added -gt 0 ]]; then
+            echo -e "\n${GREEN}✓ Config updated. Running: eximip list${NC}"
+            echo ""
+            list_ips_simple
+            echo ""
+            read -rp "Update sending IP now? [y/N]: " apply
+            [[ "$apply" =~ ^[Yy]$ ]] && update_current_ip
+        else
+            echo -e "\n${GREEN}✓ All server IPs already in rotation pool.${NC}"
+        fi
+    else
+        # Silent mode: just log
+        [[ $added -gt 0 ]] && log "sync_server_ips: added $added new IPs"
+    fi
 }
 
 # ── WHM setup guide ──────────────────────────────────────────
@@ -1229,7 +1309,8 @@ main_menu() {
         print_header
         echo -e "  ${GREEN}1)${NC} List IPs (rotation pool)"
         echo -e "  ${GREEN}i)${NC} Server IP overview (all IPs + sending status)"
-        echo -e "  ${GREEN}2)${NC} Add IP"
+        echo -e "  ${GREEN}2)${NC} Add IP manually"
+        echo -e "  ${GREEN}a)${NC} Auto-sync — detect & add all server IPs"
         echo -e "  ${GREEN}3)${NC} Remove IP"
         echo -e "  ${GREEN}4)${NC} Enable / Disable IP"
         echo -e "  ${GREEN}5)${NC} Update current sending IP now"
@@ -1251,6 +1332,7 @@ main_menu() {
             1) list_ips ;;
             i) show_server_ips ;;
             2) add_ip ;;
+            a) sync_server_ips ;;
             3) remove_ip ;;
             4) toggle_ip ;;
             5) update_current_ip ;;
@@ -1292,6 +1374,7 @@ case "${1:-menu}" in
     remove-cron)       remove_cron ;;
     setup-guide)       show_setup_guide ;;
     version|--version|-v)  echo "exim_ip_manager v${VERSION}" ;;
+    sync)                  sync_server_ips ;;
     server-ips)            show_server_ips ;;
     stats)                 show_mail_stats ;;
     deliverability)        check_deliverability ;;
