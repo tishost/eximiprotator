@@ -553,19 +553,96 @@ show_mail_stats() {
         done
     echo ""
 
-    # ── per outgoing IP stats ────────────────────────────────
-    echo -e "${BLUE}── Sent Per Outgoing IP ──────────────────────────${NC}"
-    printf "  %-18s  %-10s  %s\n" "IP" "SENT" "LABEL"
-    echo "  ──────────────────────────────────────────────"
+    # ── per outgoing IP stats (rotation pool + server IPs) ──────
+    echo -e "${BLUE}── Mail Sent Per IP ──────────────────────────────${NC}"
+    printf "  %-18s  %-8s  %-12s  %-10s  %s\n" "IP" "SENT" "IN ROTATION" "SENDING NOW" "LABEL/NOTE"
+    echo "  ────────────────────────────────────────────────────────────"
 
-    while IFS='|' read -r ip label _ _; do
-        local escaped_ip cnt
-        escaped_ip=$(echo "$ip" | sed 's/\./\\./g')
-        cnt=$(grep ' => ' "$tmpfile" \
-            | grep -c "\[${escaped_ip}\]" 2>/dev/null || echo 0)
-        printf "  %-18s  %-10s  %s\n" "$ip" "$cnt" "$label"
+    local current_ip=""
+    [[ -f "$CURRENT_IP_FILE" ]] && current_ip=$(cat "$CURRENT_IP_FILE" | tr -d '[:space:]')
+
+    # Collect all server IPs
+    local all_server_ips=()
+    while read -r sip; do
+        all_server_ips+=("$sip")
+    done < <(ip addr show 2>/dev/null \
+        | grep 'inet ' \
+        | awk '{print $2}' \
+        | cut -d/ -f1 \
+        | grep -v '^127\.' \
+        | grep -v '^::' \
+        | sort -u)
+
+    # Build list of rotation-config IPs for lookup
+    declare -A rotation_label rotation_status
+    while IFS='|' read -r ip label _ enabled; do
+        rotation_label["$ip"]="$label"
+        rotation_status["$ip"]="$enabled"
     done < <(get_all_ips)
+
+    # Track IPs already printed
+    declare -A printed
+
+    # ── print rotation IPs first ────────────────────────────────
+    while IFS='|' read -r ip label _ enabled; do
+        local escaped_ip cnt in_rot send_now note row_color
+        escaped_ip=$(echo "$ip" | sed 's/\./\\./g')
+
+        # Mail sent: try I=[ip]: field first (Exim interface log), fallback grep
+        cnt=$(grep ' => ' "$tmpfile" \
+            | grep -cP "I=\[${escaped_ip}\]" 2>/dev/null || true)
+        [[ -z "$cnt" || "$cnt" == "0" ]] && \
+            cnt=$(grep -c "I=\[${escaped_ip}\]" "$tmpfile" 2>/dev/null || echo 0)
+
+        [[ "$enabled" == "1" ]] && in_rot="${GREEN}YES (active)${NC}" || in_rot="${YELLOW}YES (disabled)${NC}"
+        [[ "$ip" == "$current_ip" ]] && send_now="${GREEN}● YES${NC}" || send_now="  no"
+        note="$label"
+        [[ "$ip" == "$current_ip" ]] && row_color="$GREEN" || row_color="$NC"
+
+        printf "  ${row_color}%-18s${NC}  %-8s  " "$ip" "$cnt"
+        echo -ne "$in_rot"
+        printf "  "
+        echo -ne "$send_now"
+        printf "  %s\n" "$note"
+
+        printed["$ip"]=1
+    done < <(get_all_ips)
+
+    # ── print remaining server IPs not in rotation ───────────────
+    for sip in "${all_server_ips[@]}"; do
+        [[ "${printed[$sip]+_}" ]] && continue
+
+        local escaped cnt send_now note
+        escaped=$(echo "$sip" | sed 's/\./\\./g')
+        cnt=$(grep -c "I=\[${escaped}\]" "$tmpfile" 2>/dev/null || echo 0)
+        [[ "$sip" == "$current_ip" ]] && send_now="${GREEN}● YES${NC}" || send_now="  no"
+
+        # Guess if it's the main server IP
+        local main_ip
+        main_ip=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
+        [[ "$sip" == "$main_ip" ]] && note="main server IP" || note="not in rotation"
+
+        printf "  %-18s  %-8s  ${RED}%-12s${NC}  " "$sip" "$cnt" "NOT IN POOL"
+        echo -ne "$send_now"
+        printf "  ${YELLOW}%s${NC}\n" "$note"
+    done
+
+    unset rotation_label rotation_status printed
     echo ""
+
+    # ── suggest adding unmanaged IPs ─────────────────────────────
+    local unmanaged=0
+    for sip in "${all_server_ips[@]}"; do
+        local found=0
+        while IFS='|' read -r ip _; do
+            [[ "$ip" == "$sip" ]] && found=1 && break
+        done < <(get_all_ips)
+        [[ $found -eq 0 ]] && unmanaged=$((unmanaged+1))
+    done
+    if [[ $unmanaged -gt 0 ]]; then
+        echo -e "  ${YELLOW}ℹ  $unmanaged server IP(s) are not in rotation pool.${NC}"
+        echo -e "  ${YELLOW}   Run: eximip add  →  to include them.${NC}\n"
+    fi
 
     # ── hourly distribution (today only) ────────────────────
     echo -e "${BLUE}── Hourly Distribution (${today}) ────────────────${NC}"
@@ -592,6 +669,124 @@ show_mail_stats() {
 
     rm -f "$tmpfile"
     log "Stats viewed: days=$days delivered=$total_delivered failed=$total_failed"
+}
+
+# ── server IP overview ───────────────────────────────────────
+
+show_server_ips() {
+    print_header
+    echo -e "${BLUE}=== Server IP Overview ===${NC}\n"
+
+    local MAINLOG="/var/log/exim_mainlog"
+    [[ ! -f "$MAINLOG" ]] && MAINLOG="/var/log/exim4/mainlog"
+
+    local current_ip=""
+    [[ -f "$CURRENT_IP_FILE" ]] && current_ip=$(cat "$CURRENT_IP_FILE" | tr -d '[:space:]')
+
+    local today
+    today=$(date '+%Y-%m-%d')
+
+    # Main server IP (default route)
+    local main_ip=""
+    main_ip=$(ip route get 8.8.8.8 2>/dev/null | grep -oP 'src \K\S+' || true)
+
+    # All IPs on server
+    local server_ips=()
+    while read -r sip; do
+        server_ips+=("$sip")
+    done < <(ip addr show 2>/dev/null \
+        | grep 'inet ' \
+        | awk '{print $2}' \
+        | cut -d/ -f1 \
+        | grep -v '^127\.' \
+        | sort -u)
+
+    echo -e "${CYAN}Main server IP  : ${GREEN}${main_ip:-unknown}${NC}"
+    echo -e "${CYAN}Current sending : ${GREEN}${current_ip:-not set}${NC}"
+    echo -e "${CYAN}Total IPs       : ${#server_ips[@]}${NC}"
+    echo -e "${CYAN}Log file        : $MAINLOG${NC}\n"
+
+    echo -e "${CYAN}──────────────────────────────────────────────────────────────────${NC}"
+    printf "  %-18s  %-8s  %-14s  %-10s  %s\n" \
+        "IP ADDRESS" "TODAY" "ROTATION" "ACTIVE NOW" "ROLE / LABEL"
+    echo -e "${CYAN}──────────────────────────────────────────────────────────────────${NC}"
+
+    # Build rotation lookup
+    declare -A rot_label rot_enabled
+    while IFS='|' read -r ip label _ enabled; do
+        rot_label["$ip"]="$label"
+        rot_enabled["$ip"]="$enabled"
+    done < <(get_all_ips)
+
+    for sip in "${server_ips[@]}"; do
+        local sent=0 rotation_col active_col role
+
+        # Mail sent today via this IP (I=[ip]: in Exim log)
+        if [[ -f "$MAINLOG" ]]; then
+            local esc
+            esc=$(echo "$sip" | sed 's/\./\\./g')
+            sent=$(grep "^${today}" "$MAINLOG" \
+                | grep -cP "I=\[${esc}\]" 2>/dev/null || echo 0)
+        fi
+
+        # Rotation status
+        if [[ -n "${rot_label[$sip]+_}" ]]; then
+            if [[ "${rot_enabled[$sip]}" == "1" ]]; then
+                rotation_col="${GREEN}IN POOL (on)${NC}"
+            else
+                rotation_col="${YELLOW}IN POOL (off)${NC}"
+            fi
+            role="${rot_label[$sip]}"
+        else
+            rotation_col="${RED}NOT IN POOL${NC}"
+            [[ "$sip" == "$main_ip" ]] && role="main server IP" || role="—"
+        fi
+
+        # Active now?
+        if [[ "$sip" == "$current_ip" ]]; then
+            active_col="${GREEN}● SENDING${NC}"
+        else
+            active_col="  —"
+        fi
+
+        # Row highlight for current sending IP
+        if [[ "$sip" == "$current_ip" ]]; then
+            printf "  ${GREEN}%-18s${NC}  %-8s  " "$sip" "$sent"
+        else
+            printf "  %-18s  %-8s  " "$sip" "$sent"
+        fi
+        echo -ne "$rotation_col"
+        printf "  "
+        echo -ne "$active_col"
+        printf "  %s\n" "$role"
+    done
+
+    unset rot_label rot_enabled
+
+    echo -e "${CYAN}──────────────────────────────────────────────────────────────────${NC}"
+
+    # Count unmanaged IPs
+    local unmanaged=0
+    for sip in "${server_ips[@]}"; do
+        local f=0
+        while IFS='|' read -r ip _; do [[ "$ip" == "$sip" ]] && f=1 && break; done < <(get_all_ips)
+        [[ $f -eq 0 ]] && unmanaged=$((unmanaged+1))
+    done
+
+    echo ""
+    if [[ $unmanaged -gt 0 ]]; then
+        echo -e "  ${YELLOW}⚠  $unmanaged IP(s) on this server are not in the rotation pool.${NC}"
+        echo -e "  ${YELLOW}   Use: eximip add  →  to add them.${NC}"
+    else
+        echo -e "  ${GREEN}✓  All server IPs are in the rotation pool.${NC}"
+    fi
+
+    # Warn if main IP is sending (not in rotation)
+    if [[ -n "$current_ip" && "$current_ip" == "$main_ip" ]]; then
+        echo -e "\n  ${YELLOW}⚠  Main server IP is currently sending mail.${NC}"
+        echo -e "  ${YELLOW}   Add more IPs and run: eximip update-ip${NC}"
+    fi
+    echo ""
 }
 
 # ── deliverability check ─────────────────────────────────────
@@ -1032,7 +1227,8 @@ GUIDE
 main_menu() {
     while true; do
         print_header
-        echo -e "  ${GREEN}1)${NC} List IPs"
+        echo -e "  ${GREEN}1)${NC} List IPs (rotation pool)"
+        echo -e "  ${GREEN}i)${NC} Server IP overview (all IPs + sending status)"
         echo -e "  ${GREEN}2)${NC} Add IP"
         echo -e "  ${GREEN}3)${NC} Remove IP"
         echo -e "  ${GREEN}4)${NC} Enable / Disable IP"
@@ -1053,6 +1249,7 @@ main_menu() {
 
         case $choice in
             1) list_ips ;;
+            i) show_server_ips ;;
             2) add_ip ;;
             3) remove_ip ;;
             4) toggle_ip ;;
@@ -1095,6 +1292,7 @@ case "${1:-menu}" in
     remove-cron)       remove_cron ;;
     setup-guide)       show_setup_guide ;;
     version|--version|-v)  echo "exim_ip_manager v${VERSION}" ;;
+    server-ips)            show_server_ips ;;
     stats)                 show_mail_stats ;;
     deliverability)        check_deliverability ;;
     deliverability-fails)  check_deliverability fails ;;
