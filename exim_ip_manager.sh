@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.3.0
+#  Version : 1.3.1
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -986,7 +986,6 @@ show_server_ips() {
 check_ip_deliverability() {
     print_header
     echo -e "${BLUE}=== IP Deliverability Check — Rotation Pool ===${NC}\n"
-    echo -e "প্রতিটা rotation IP আলাদাভাবে check করা হবে।\n"
 
     command -v dig &>/dev/null || die "dig not found: yum install bind-utils"
 
@@ -998,13 +997,48 @@ check_ip_deliverability() {
         return 1
     fi
 
-    read -rp "Sending domain (e.g. example.com): " domain
-    [[ -z "$domain" ]] && echo -e "${RED}Domain required.${NC}" && return 1
+    # ── auto-detect domain ────────────────────────────────────
+    local domain=""
 
-    # Fetch SPF record once (shared across all IPs)
-    local spf_record
-    spf_record=$(dig +short TXT "$domain" 2>/dev/null \
-        | grep -i 'v=spf1' | tr -d '"' || true)
+    # 1. WHM main domain from /etc/wwwacct.conf
+    if [[ -f /etc/wwwacct.conf ]]; then
+        local whm_host
+        whm_host=$(grep '^HOST ' /etc/wwwacct.conf 2>/dev/null | awk '{print $2}')
+        # Strip leading hostname label → keep domain
+        if [[ -n "$whm_host" ]]; then
+            domain=$(echo "$whm_host" | awk -F. '{
+                n=NF; if(n>=2) print $(n-1)"."$n; else print $0}')
+        fi
+    fi
+
+    # 2. Fallback: strip first label from server hostname
+    if [[ -z "$domain" ]]; then
+        local fqdn
+        fqdn=$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)
+        if [[ "$fqdn" == *.*.* ]]; then
+            domain=$(echo "$fqdn" | cut -d. -f2-)
+        elif [[ "$fqdn" == *.* ]]; then
+            domain="$fqdn"
+        fi
+    fi
+
+    # 3. Ask user — but skip SPF if still empty
+    if [[ -n "$domain" ]]; then
+        echo -e "${CYAN}Auto-detected domain: ${GREEN}$domain${NC}"
+        read -rp "Use this domain? Press Enter to confirm or type another: " user_domain
+        [[ -n "$user_domain" ]] && domain="$user_domain"
+    else
+        echo -e "${YELLOW}Domain auto-detect failed.${NC}"
+        read -rp "Sending domain (Enter to skip SPF check): " domain
+    fi
+
+    # Fetch SPF record (empty domain = skip SPF)
+    local spf_record="" spf_available=0
+    if [[ -n "$domain" ]]; then
+        spf_record=$(dig +short TXT "$domain" 2>/dev/null \
+            | grep -i 'v=spf1' | tr -d '"' || true)
+        spf_available=1
+    fi
 
     # DNSBL list
     local BLACKLISTS=(
@@ -1016,10 +1050,20 @@ check_ip_deliverability() {
     )
 
     local total_ips=0 ready_ips=0
-    local failed_ips=()   # IPs that failed critical checks
+    local failed_ips=()
 
-    echo -e "${CYAN}Domain  : $domain${NC}"
-    echo -e "${CYAN}SPF     : ${spf_record:-${RED}NOT FOUND${NC}}${NC}\n"
+    echo ""
+    [[ -n "$domain" ]] && echo -e "${CYAN}Domain  : $domain${NC}"
+    if [[ $spf_available -eq 1 ]]; then
+        if [[ -n "$spf_record" ]]; then
+            echo -e "${CYAN}SPF     : ${GREEN}found${NC}"
+        else
+            echo -e "${CYAN}SPF     : ${RED}NOT FOUND for $domain${NC}"
+        fi
+    else
+        echo -e "${CYAN}SPF     : ${YELLOW}skipped (no domain)${NC}"
+    fi
+    echo -e "${CYAN}IPs     : $active active in pool${NC}\n"
 
     # ── per-IP checks ─────────────────────────────────────────
     while IFS='|' read -r ip label limit enabled; do
@@ -1058,18 +1102,22 @@ check_ip_deliverability() {
             fi
 
             # ── 3. PTR contains domain ────────────────────────
-            if echo "$ptr" | grep -qi "$domain"; then
-                echo -e "  ${GREEN}✓ PTR name: contains '$domain'${NC}"
-                ip_pass=$((ip_pass+1))
-            else
-                echo -e "  ${YELLOW}⚠ PTR name: '$ptr' does not contain '$domain'${NC}"
-                issues+=("PTR hostname mismatch")
-                ip_warn=$((ip_warn+1))
+            if [[ -n "$domain" ]]; then
+                if echo "$ptr" | grep -qi "$domain"; then
+                    echo -e "  ${GREEN}✓ PTR name: contains '$domain'${NC}"
+                    ip_pass=$((ip_pass+1))
+                else
+                    echo -e "  ${YELLOW}⚠ PTR name: '$ptr' does not contain '$domain'${NC}"
+                    issues+=("PTR hostname mismatch")
+                    ip_warn=$((ip_warn+1))
+                fi
             fi
         fi
 
         # ── 4. SPF includes this IP ─────────────────────────────
-        if [[ -z "$spf_record" ]]; then
+        if [[ $spf_available -eq 0 ]]; then
+            echo -e "  ${CYAN}ℹ SPF     : skipped (no domain provided)${NC}"
+        elif [[ -z "$spf_record" ]]; then
             echo -e "  ${RED}✗ SPF     : No SPF record for $domain${NC}"
             issues+=("No SPF record")
             ip_fail=$((ip_fail+1))
