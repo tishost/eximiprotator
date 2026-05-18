@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.8.2
+#  Version : 1.8.3
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.8.2"
+VERSION="1.8.3"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -346,32 +346,9 @@ _update_cpanel_mailfiles() {
         echo -e "${GREEN}✓ /etc/mailips   : *: ${new_ip}${NC}" && \
         echo -e "${GREEN}✓ /etc/mailhello : *: ${new_helo:-$new_ip}${NC}"
 
-    # cPanel's Exim does NOT re-read /etc/mailips dynamically —
-    # a restart is required for the new IP to take effect.
-    _restart_exim "$silent"
-
+    # Per official cPanel docs: /etc/mailips is read per-delivery via lsearch —
+    # no Exim restart is needed after editing this file.
     log "mailips/mailhello updated: *: $new_ip helo=$new_helo"
-}
-
-# Graceful Exim restart — uses WHM script when available, falls back to service.
-_restart_exim() {
-    local silent="${1:-}"
-
-    if command -v /scripts/restartsrv_exim &>/dev/null; then
-        /scripts/restartsrv_exim > /dev/null 2>&1 && \
-            { [[ "$silent" != "silent" ]] && \
-              echo -e "${GREEN}✓ Exim restarted (WHM)${NC}"; } || \
-            { [[ "$silent" != "silent" ]] && \
-              echo -e "${YELLOW}⚠ Exim restart via WHM failed — trying service...${NC}"
-              service exim restart > /dev/null 2>&1; }
-    else
-        service exim restart > /dev/null 2>&1 && \
-            { [[ "$silent" != "silent" ]] && \
-              echo -e "${GREEN}✓ Exim restarted${NC}"; } || \
-            { [[ "$silent" != "silent" ]] && \
-              echo -e "${YELLOW}⚠ Exim restart failed — run manually: service exim restart${NC}"; }
-    fi
-    log "Exim restarted for mailips/mailhello changes"
 }
 
 # Called by cron every hour — auto-sync then rotate
