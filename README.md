@@ -2,7 +2,7 @@
 
 WHM/cPanel server এ multiple IP থেকে email rotation manage করার CLI tool।
 
-**Version:** 1.8.3
+**Version:** 1.9.0
 
 ## Features
 

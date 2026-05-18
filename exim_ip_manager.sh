@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.8.3
+#  Version : 1.9.0
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.8.3"
+VERSION="1.9.0"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -217,6 +217,16 @@ _apply_ip() {
     local selected_ip="$1"
     local silent="${2:-}"
 
+    # Guard: refuse to apply an IP that is not bound to any network interface.
+    # Exim will fail with "Cannot assign requested address" if we do.
+    if ! ip addr show 2>/dev/null | grep -q "inet ${selected_ip}/"; then
+        log "ERROR: _apply_ip: $selected_ip is not assigned to any interface — skipping"
+        [[ "$silent" != "silent" ]] && \
+            echo -e "${RED}✗ IP $selected_ip is not assigned to this server's network interface.${NC}" && \
+            echo -e "${YELLOW}  Disable it: eximip menu → 4  then run: eximip update-ip${NC}"
+        return 1
+    fi
+
     local tmp
     tmp=$(mktemp /etc/exim_current_ip.XXXXXX)
     echo -n "$selected_ip" > "$tmp"
@@ -245,12 +255,31 @@ update_current_ip() {
         return 1
     fi
 
-    local epoch idx selected_ip
+    local epoch idx
     epoch=$(date +%s)
     idx=$(( (epoch / 3600) % active ))
-    selected_ip=$(get_ips | sed -n "$((idx + 1))p" | cut -d'|' -f1)
 
-    [[ -z "$selected_ip" ]] && die "Could not determine IP for slot $idx"
+    # Try each IP in the pool in order starting from the scheduled slot.
+    # Skip any IP that is not actually bound to a network interface.
+    local attempts=0 selected_ip=""
+    while [[ $attempts -lt $active ]]; do
+        local candidate
+        candidate=$(get_ips | sed -n "$(( (idx + attempts) % active + 1 ))p" | cut -d'|' -f1)
+        if ip addr show 2>/dev/null | grep -q "inet ${candidate}/"; then
+            selected_ip="$candidate"
+            break
+        fi
+        log "update_current_ip: $candidate not on interface, skipping"
+        attempts=$((attempts + 1))
+    done
+
+    if [[ -z "$selected_ip" ]]; then
+        log "ERROR: no active IP in pool is assigned to a network interface"
+        [[ "$silent" != "silent" ]] && \
+            echo -e "${RED}✗ None of the active IPs are assigned to this server.${NC}" && \
+            echo -e "${YELLOW}  Run: eximip sync  to refresh the IP pool.${NC}"
+        return 1
+    fi
 
     _apply_ip "$selected_ip" "$silent"
     log "IP updated: $selected_ip slot=$idx/$active"
