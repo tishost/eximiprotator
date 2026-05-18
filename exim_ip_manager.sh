@@ -1,15 +1,16 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.6.1
+#  Version : 1.7.0
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.6.1"
+VERSION="1.7.0"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
+PAUSE_FILE="/etc/exim_rotation_paused"
 LOG_FILE="/var/log/exim_ip_rotation.log"
 BACKUP_DIR="/etc/exim_rotation_backups"
 
@@ -209,6 +210,31 @@ list_ips() {
 #
 # One-time WHM setup required (see: eximip setup-guide)
 
+# Writes a specific IP to all three routing files:
+#   /etc/exim_current_ip  /etc/mailips  /etc/mailhello
+# Used by both rotation and pinned-IP (pause) modes.
+_apply_ip() {
+    local selected_ip="$1"
+    local silent="${2:-}"
+
+    local tmp
+    tmp=$(mktemp /etc/exim_current_ip.XXXXXX)
+    echo -n "$selected_ip" > "$tmp"
+    chmod 644 "$tmp"
+    mv "$tmp" "$CURRENT_IP_FILE"
+
+    local ptr_host=""
+    ptr_host=$(dig +short -x "$selected_ip" 2>/dev/null | sed 's/\.$//' || true)
+    [[ -z "$ptr_host" ]] && ptr_host=$(hostname -f 2>/dev/null || true)
+
+    _update_cpanel_mailfiles "$selected_ip" "$ptr_host" "$silent"
+
+    [[ "$silent" != "silent" ]] && \
+        echo -e "${GREEN}✓ Sending IP set to: $selected_ip${NC}" && \
+        [[ -n "$ptr_host" ]] && \
+        echo -e "${GREEN}✓ HELO hostname   : $ptr_host${NC}"
+}
+
 update_current_ip() {
     local silent="${1:-}"
     local active
@@ -226,27 +252,8 @@ update_current_ip() {
 
     [[ -z "$selected_ip" ]] && die "Could not determine IP for slot $idx"
 
-    # ── 1. /etc/exim_current_ip (Exim transport readfile) ────────
-    local tmp
-    tmp=$(mktemp /etc/exim_current_ip.XXXXXX)
-    echo -n "$selected_ip" > "$tmp"
-    chmod 644 "$tmp"
-    mv "$tmp" "$CURRENT_IP_FILE"
-
-    # ── 2. /etc/mailips — cPanel native per-domain IP routing ────
-    # Get PTR hostname for HELO
-    local ptr_host=""
-    ptr_host=$(dig +short -x "$selected_ip" 2>/dev/null | sed 's/\.$//' || true)
-    [[ -z "$ptr_host" ]] && ptr_host=$(hostname -f 2>/dev/null || true)
-
-    _update_cpanel_mailfiles "$selected_ip" "$ptr_host" "$silent"
-
-    [[ "$silent" != "silent" ]] && \
-        echo -e "${GREEN}✓ Sending IP set to: $selected_ip${NC}" && \
-        [[ -n "$ptr_host" ]] && \
-        echo -e "${GREEN}✓ HELO hostname   : $ptr_host${NC}"
-
-    log "IP updated: $selected_ip ptr=$ptr_host slot=$idx/$active"
+    _apply_ip "$selected_ip" "$silent"
+    log "IP updated: $selected_ip slot=$idx/$active"
 }
 
 # Updates /etc/mailips and /etc/mailhello using wildcard catch-all.
@@ -344,6 +351,21 @@ _update_cpanel_mailfiles() {
 # Called by cron every hour — auto-sync then rotate
 cron_rotate() {
     sync_server_ips silent
+
+    # If rotation is paused, keep the pinned IP in place (don't switch)
+    if [[ -f "$PAUSE_FILE" ]]; then
+        local pinned_ip
+        pinned_ip=$(tr -d '[:space:]' < "$PAUSE_FILE")
+        if validate_ip "$pinned_ip"; then
+            _apply_ip "$pinned_ip" silent
+            log "cron: rotation paused — keeping pinned IP $pinned_ip"
+        else
+            log "cron: pause file invalid ($pinned_ip) — resuming rotation"
+            rm -f "$PAUSE_FILE"
+        fi
+        return
+    fi
+
     local active
     active=$(ip_count)
     [[ $active -eq 0 ]] && log "cron_rotate: no active IPs, skipping" && exit 0
@@ -636,6 +658,17 @@ show_status() {
     epoch=$(date +%s)
     active=$(ip_count)
 
+    # ── pause state banner ────────────────────────────────────
+    if [[ -f "$PAUSE_FILE" ]]; then
+        local pinned_ip
+        pinned_ip=$(tr -d '[:space:]' < "$PAUSE_FILE")
+        echo -e "${YELLOW}⏸  ROTATION PAUSED — pinned IP: ${GREEN}${pinned_ip}${YELLOW}${NC}"
+        echo -e "${YELLOW}   Hourly cron চলছে কিন্তু IP switch হবে না।${NC}"
+        echo -e "${YELLOW}   Resume করতে: eximip rotation-pause${NC}\n"
+    else
+        echo -e "${GREEN}▶  ROTATION ACTIVE — hourly auto-switch চলছে${NC}\n"
+    fi
+
     echo -e "Server time   : $(date)"
     echo -e "Active IPs    : $active"
 
@@ -646,7 +679,7 @@ show_status() {
         echo -e "Sending via   : ${RED}NOT SET — run: eximip update-ip${NC}"
     fi
 
-    if [[ $active -gt 0 ]]; then
+    if [[ $active -gt 0 ]] && [[ ! -f "$PAUSE_FILE" ]]; then
         local next_switch
         next_switch=$(( 3600 - (epoch % 3600) ))
         printf "Next rotation : in %d min %d sec\n" $((next_switch / 60)) $((next_switch % 60))
@@ -1772,6 +1805,94 @@ GUIDE
     echo ""
 }
 
+# ── rotation pause / resume ──────────────────────────────────
+
+# Interactively pick one active IP and write it to PAUSE_FILE + apply it.
+_select_pin_ip() {
+    local active
+    active=$(ip_count)
+
+    if [[ $active -eq 0 ]]; then
+        echo -e "${RED}No active IPs in rotation pool.${NC}"
+        return 1
+    fi
+
+    echo -e "\n${CYAN}Active IPs in rotation pool:${NC}\n"
+    local i=1
+    local ip_array=()
+    while IFS='|' read -r ip label limit _; do
+        printf "  ${GREEN}%d)${NC} %-18s  %-20s  (limit: %s/hr)\n" \
+            "$i" "$ip" "$label" "$limit"
+        ip_array+=("$ip")
+        i=$((i+1))
+    done < <(get_ips)
+
+    echo ""
+    read -rp "IP number নির্বাচন করো (1-${#ip_array[@]}): " sel
+
+    if [[ "$sel" =~ ^[0-9]+$ ]] && \
+       [[ $sel -ge 1 ]] && [[ $sel -le ${#ip_array[@]} ]]; then
+        local chosen_ip="${ip_array[$((sel-1))]}"
+        echo -n "$chosen_ip" > "$PAUSE_FILE"
+        _apply_ip "$chosen_ip"
+        echo -e "\n${GREEN}✓ Rotation paused. Sending from: ${chosen_ip}${NC}"
+        echo -e "${YELLOW}  Resume করতে menu → p  অথবা: eximip rotation-pause${NC}"
+        log "Rotation paused, pinned IP: $chosen_ip"
+    else
+        echo -e "${RED}Invalid selection — rotation unchanged.${NC}"
+    fi
+}
+
+manage_rotation_pause() {
+    print_header
+    echo -e "${BLUE}=== Rotation Pause / Resume ===${NC}\n"
+
+    if [[ -f "$PAUSE_FILE" ]]; then
+        local pinned_ip
+        pinned_ip=$(tr -d '[:space:]' < "$PAUSE_FILE")
+
+        echo -e "${YELLOW}⏸  Rotation is currently PAUSED${NC}"
+        echo -e "   Pinned IP : ${GREEN}${pinned_ip}${NC}"
+        echo -e "   Cron প্রতি ঘণ্টায় চললেও IP switch হবে না।\n"
+
+        echo -e "  ${GREEN}1)${NC} Resume rotation (auto-rotate চালু করো)"
+        echo -e "  ${GREEN}2)${NC} Change pinned IP (অন্য IP pin করো)"
+        echo -e "  ${RED}0)${NC} Cancel"
+        echo ""
+        read -rp "Select: " choice
+
+        case $choice in
+            1)
+                rm -f "$PAUSE_FILE"
+                update_current_ip
+                echo -e "\n${GREEN}✓ Rotation resumed. Hourly auto-rotation active.${NC}"
+                log "Rotation resumed"
+                ;;
+            2)
+                _select_pin_ip
+                ;;
+            *)
+                return
+                ;;
+        esac
+    else
+        echo -e "${GREEN}▶  Rotation is currently ACTIVE${NC}"
+        echo -e "   প্রতি ঘণ্টায় IP স্বয়ংক্রিয়ভাবে switch হচ্ছে।\n"
+        echo -e "Pause করলে hourly cron IP বদলাবে না।"
+        echo -e "তুমি যে IP দেবে শুধু সেটা থেকে mail যাবে।\n"
+
+        echo -e "  ${GREEN}1)${NC} Pause rotation — একটা IP fix করো"
+        echo -e "  ${RED}0)${NC} Cancel"
+        echo ""
+        read -rp "Select: " choice
+
+        case $choice in
+            1) _select_pin_ip ;;
+            *) return ;;
+        esac
+    fi
+}
+
 # ── menu ─────────────────────────────────────────────────────
 
 main_menu() {
@@ -1784,6 +1905,11 @@ main_menu() {
         echo -e "  ${GREEN}3)${NC} Remove IP"
         echo -e "  ${GREEN}4)${NC} Enable / Disable IP"
         echo -e "  ${GREEN}5)${NC} Update current sending IP now"
+        if [[ -f "$PAUSE_FILE" ]]; then
+            echo -e "  ${YELLOW}p)${NC} ${YELLOW}⏸  Resume rotation (currently PAUSED)${NC}"
+        else
+            echo -e "  ${GREEN}p)${NC} Pause rotation (fix a specific sending IP)"
+        fi
         echo -e "  ${GREEN}6)${NC} Live rotation schedule (24h)"
         echo -e "  ${GREEN}7)${NC} Blacklist check"
         echo -e "  ${GREEN}8)${NC} DNS / SPF / PTR helper"
@@ -1808,6 +1934,7 @@ main_menu() {
             3) remove_ip ;;
             4) toggle_ip ;;
             5) update_current_ip ;;
+            p) manage_rotation_pause ;;
             6) show_status ;;
             7) check_blacklist ;;
             8) dns_check ;;
@@ -1839,8 +1966,9 @@ case "${1:-menu}" in
     remove)        remove_ip ;;
     list)          list_ips ;;
     status)        show_status ;;
-    update-ip)     update_current_ip ;;
-    cron-rotate)   cron_rotate ;;
+    update-ip)        update_current_ip ;;
+    rotation-pause)   manage_rotation_pause ;;
+    cron-rotate)      cron_rotate ;;
     blacklist)     check_blacklist ;;
     dns)           dns_check ;;
     logs)          show_logs ;;
@@ -1857,7 +1985,7 @@ case "${1:-menu}" in
     ip-add-guide)          show_ip_add_guide ;;
     uninstall)             uninstall ;;
     *)
-        echo "Usage: $0 [menu|add|remove|list|status|update-ip|blacklist|dns|logs|stats|install-cron|setup-guide|deliverability|deliverability-fails|ip-add-guide]"
+        echo "Usage: $0 [menu|add|remove|list|status|update-ip|rotation-pause|blacklist|dns|logs|stats|install-cron|setup-guide|deliverability|deliverability-fails|ip-add-guide]"
         exit 1
         ;;
 esac
