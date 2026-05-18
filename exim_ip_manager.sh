@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.2.0
+#  Version : 1.3.0
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -981,6 +981,228 @@ show_server_ips() {
     echo ""
 }
 
+# ── IP deliverability check (per rotation IP) ────────────────
+
+check_ip_deliverability() {
+    print_header
+    echo -e "${BLUE}=== IP Deliverability Check — Rotation Pool ===${NC}\n"
+    echo -e "প্রতিটা rotation IP আলাদাভাবে check করা হবে।\n"
+
+    command -v dig &>/dev/null || die "dig not found: yum install bind-utils"
+
+    local active
+    active=$(ip_count)
+    if [[ $active -eq 0 ]]; then
+        echo -e "${RED}No active IPs in rotation pool.${NC}"
+        echo -e "Run: ${YELLOW}eximip sync${NC} or ${YELLOW}eximip add${NC}"
+        return 1
+    fi
+
+    read -rp "Sending domain (e.g. example.com): " domain
+    [[ -z "$domain" ]] && echo -e "${RED}Domain required.${NC}" && return 1
+
+    # Fetch SPF record once (shared across all IPs)
+    local spf_record
+    spf_record=$(dig +short TXT "$domain" 2>/dev/null \
+        | grep -i 'v=spf1' | tr -d '"' || true)
+
+    # DNSBL list
+    local BLACKLISTS=(
+        "zen.spamhaus.org"
+        "b.barracudacentral.org"
+        "bl.spamcop.net"
+        "dnsbl.sorbs.net"
+        "ix.dnsbl.manitu.net"
+    )
+
+    local total_ips=0 ready_ips=0
+    local failed_ips=()   # IPs that failed critical checks
+
+    echo -e "${CYAN}Domain  : $domain${NC}"
+    echo -e "${CYAN}SPF     : ${spf_record:-${RED}NOT FOUND${NC}}${NC}\n"
+
+    # ── per-IP checks ─────────────────────────────────────────
+    while IFS='|' read -r ip label limit enabled; do
+        total_ips=$((total_ips+1))
+        local ip_pass=0 ip_fail=0 ip_warn=0
+        local critical_fail=0
+        local issues=()
+
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${BLUE}  IP: ${ip}  (${label})${NC}"
+        echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+
+        # ── 1. PTR / rDNS ──────────────────────────────────────
+        local ptr=""
+        ptr=$(dig +short +time=5 -x "$ip" 2>/dev/null | sed 's/\.$//' || true)
+
+        if [[ -z "$ptr" ]]; then
+            echo -e "  ${RED}✗ PTR     : NOT SET${NC} — mail will be rejected by Gmail/Yahoo"
+            issues+=("PTR missing")
+            ip_fail=$((ip_fail+1))
+            critical_fail=1
+        else
+            echo -e "  ${GREEN}✓ PTR     : $ptr${NC}"
+            ip_pass=$((ip_pass+1))
+
+            # ── 2. FCrDNS ────────────────────────────────────
+            local fwd
+            fwd=$(dig +short A "$ptr" 2>/dev/null | head -1 || true)
+            if [[ "$fwd" == "$ip" ]]; then
+                echo -e "  ${GREEN}✓ FCrDNS  : $ptr → $ip (match)${NC}"
+                ip_pass=$((ip_pass+1))
+            else
+                echo -e "  ${YELLOW}⚠ FCrDNS  : $ptr → ${fwd:-none} (expected $ip)${NC}"
+                issues+=("FCrDNS mismatch")
+                ip_warn=$((ip_warn+1))
+            fi
+
+            # ── 3. PTR contains domain ────────────────────────
+            if echo "$ptr" | grep -qi "$domain"; then
+                echo -e "  ${GREEN}✓ PTR name: contains '$domain'${NC}"
+                ip_pass=$((ip_pass+1))
+            else
+                echo -e "  ${YELLOW}⚠ PTR name: '$ptr' does not contain '$domain'${NC}"
+                issues+=("PTR hostname mismatch")
+                ip_warn=$((ip_warn+1))
+            fi
+        fi
+
+        # ── 4. SPF includes this IP ─────────────────────────────
+        if [[ -z "$spf_record" ]]; then
+            echo -e "  ${RED}✗ SPF     : No SPF record for $domain${NC}"
+            issues+=("No SPF record")
+            ip_fail=$((ip_fail+1))
+            critical_fail=1
+        else
+            local in_spf=0
+            # Direct ip4: match
+            if echo "$spf_record" | grep -q "ip4:${ip}"; then
+                in_spf=1
+            else
+                # CIDR /24 match
+                local ip_prefix="${ip%.*}"
+                if echo "$spf_record" | grep -qP "ip4:${ip_prefix//./\\.}\\.0/"; then
+                    in_spf=1
+                fi
+            fi
+
+            if [[ $in_spf -eq 1 ]]; then
+                echo -e "  ${GREEN}✓ SPF     : IP authorized in SPF record${NC}"
+                ip_pass=$((ip_pass+1))
+            else
+                echo -e "  ${RED}✗ SPF     : IP NOT in SPF record${NC}"
+                echo -e "  ${YELLOW}  Add: ip4:${ip} to your SPF record${NC}"
+                issues+=("IP not in SPF")
+                ip_fail=$((ip_fail+1))
+                critical_fail=1
+            fi
+        fi
+
+        # ── 5. SMTP port 25 ─────────────────────────────────────
+        if command -v nc &>/dev/null; then
+            if nc -z -w5 "$ip" 25 2>/dev/null; then
+                echo -e "  ${GREEN}✓ Port 25 : open${NC}"
+                ip_pass=$((ip_pass+1))
+
+                # ── 6. SMTP banner ────────────────────────────
+                local banner
+                banner=$(echo "QUIT" | timeout 5 nc "$ip" 25 2>/dev/null | head -1 || true)
+                if [[ -n "$banner" ]]; then
+                    local banner_host
+                    banner_host=$(echo "$banner" | grep -oP '(?<=220 )\S+' || true)
+                    if [[ -n "$ptr" && "$banner_host" == "$ptr" ]]; then
+                        echo -e "  ${GREEN}✓ Banner  : $banner_host (matches PTR)${NC}"
+                        ip_pass=$((ip_pass+1))
+                    elif [[ -n "$banner_host" ]]; then
+                        echo -e "  ${YELLOW}⚠ Banner  : $banner_host ≠ PTR '$ptr'${NC}"
+                        issues+=("SMTP banner mismatch")
+                        ip_warn=$((ip_warn+1))
+                    fi
+                fi
+            else
+                echo -e "  ${YELLOW}⚠ Port 25 : closed or filtered${NC}"
+                issues+=("Port 25 closed")
+                ip_warn=$((ip_warn+1))
+            fi
+        else
+            echo -e "  ${CYAN}ℹ Port 25 : skipped (nc not installed)${NC}"
+        fi
+
+        # ── 7. Blacklist ─────────────────────────────────────────
+        local reversed listed=0
+        reversed=$(echo "$ip" | awk -F. '{print $4"."$3"."$2"."$1}')
+        for bl in "${BLACKLISTS[@]}"; do
+            local bl_result
+            bl_result=$(dig +short +time=3 +tries=1 "${reversed}.${bl}" 2>/dev/null || true)
+            if [[ -n "$bl_result" ]]; then
+                echo -e "  ${RED}✗ Blacklst: LISTED on $bl${NC}"
+                issues+=("Blacklisted: $bl")
+                ip_fail=$((ip_fail+1))
+                critical_fail=1
+                listed=1
+            fi
+        done
+        [[ $listed -eq 0 ]] && \
+            echo -e "  ${GREEN}✓ Blacklst: clean (checked ${#BLACKLISTS[@]} lists)${NC}" && \
+            ip_pass=$((ip_pass+1))
+
+        # ── IP result summary ─────────────────────────────────
+        echo ""
+        local total_checks_ip=$(( ip_pass + ip_fail + ip_warn ))
+        local ip_score=0
+        [[ $total_checks_ip -gt 0 ]] && ip_score=$(( ip_pass * 100 / total_checks_ip ))
+
+        if [[ $critical_fail -eq 0 ]]; then
+            ready_ips=$((ready_ips+1))
+            echo -e "  ${GREEN}● READY TO SEND  — score ${ip_score}/100${NC}"
+        else
+            failed_ips+=("$ip")
+            echo -e "  ${RED}● NOT READY  — score ${ip_score}/100${NC}"
+            echo -e "  ${RED}  Issues: $(IFS=', '; echo "${issues[*]}")${NC}"
+        fi
+
+        if [[ ${#issues[@]} -gt 0 && $critical_fail -eq 0 ]]; then
+            echo -e "  ${YELLOW}  Warnings: $(IFS=', '; echo "${issues[*]}")${NC}"
+        fi
+
+        log "IP check: $ip score=$ip_score pass=$ip_pass fail=$ip_fail warn=$ip_warn"
+
+    done < <(get_ips)
+
+    # ── Final summary ─────────────────────────────────────────
+    echo -e "\n${CYAN}══════════════════════════════════════════════${NC}"
+    echo -e "${BLUE}  SUMMARY — $domain${NC}"
+    echo -e "${CYAN}══════════════════════════════════════════════${NC}"
+    printf "  Total IPs checked : %d\n"    "$total_ips"
+    printf "  Ready to send     : ${GREEN}%d${NC}\n" "$ready_ips"
+    printf "  Has issues        : ${RED}%d${NC}\n"   "${#failed_ips[@]}"
+
+    if [[ ${#failed_ips[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${RED}IPs with critical issues:${NC}"
+        for fip in "${failed_ips[@]}"; do
+            echo -e "    ${RED}• $fip${NC}"
+        done
+        echo ""
+        read -rp "  এই IPs গুলো এখনই disable করবো? [y/N]: " do_disable
+        if [[ "$do_disable" =~ ^[Yy]$ ]]; then
+            for fip in "${failed_ips[@]}"; do
+                local escaped
+                escaped=$(echo "$fip" | sed 's/\./\\./g')
+                sed -i "s/^${escaped}|\(.*\)|1$/${fip}|\1|0/" "$CONFIG_FILE"
+                echo -e "  ${YELLOW}⏸ Disabled: $fip${NC}"
+                log "Auto-disabled IP (deliverability fail): $fip"
+            done
+            echo ""
+            echo -e "  ${GREEN}✓ Done. Run: eximip update-ip to rotate away from them.${NC}"
+        fi
+    else
+        echo -e "\n  ${GREEN}✓ All IPs are ready to send!${NC}"
+    fi
+    echo -e "${CYAN}══════════════════════════════════════════════${NC}\n"
+}
+
 # ── deliverability check ─────────────────────────────────────
 
 check_deliverability() {
@@ -1431,8 +1653,9 @@ main_menu() {
         echo -e "  ${GREEN}8)${NC} DNS / SPF / PTR helper"
         echo -e "  ${GREEN}9)${NC} View logs"
         echo -e "  ${GREEN}m)${NC} Mail send statistics (daily / user / IP)"
-        echo -e "  ${GREEN}d)${NC} Deliverability check — full report"
-        echo -e "  ${GREEN}f)${NC} Deliverability check — failures & warnings only"
+        echo -e "  ${GREEN}d)${NC} IP Deliverability check (PTR/SPF/blacklist per IP)"
+        echo -e "  ${GREEN}D)${NC} Domain Deliverability check — full report"
+        echo -e "  ${GREEN}f)${NC} Domain Deliverability check — failures only"
         echo -e "  ${GREEN}g)${NC} cPanel IP add guide (safe step-by-step)"
         echo -e "  ${CYAN}s)${NC} WHM setup guide (read first!)"
         echo -e "  ${CYAN}c)${NC} Install hourly cron"
@@ -1454,7 +1677,8 @@ main_menu() {
             8) dns_check ;;
             9) show_logs ;;
             m) show_mail_stats ;;
-            d) check_deliverability ;;
+            d) check_ip_deliverability ;;
+            D) check_deliverability ;;
             f) check_deliverability fails ;;
             g) show_ip_add_guide ;;
             s) show_setup_guide ;;
@@ -1491,6 +1715,7 @@ case "${1:-menu}" in
     sync)                  sync_server_ips ;;
     server-ips)            show_server_ips ;;
     stats)                 show_mail_stats ;;
+    ip-check)              check_ip_deliverability ;;
     deliverability)        check_deliverability ;;
     deliverability-fails)  check_deliverability fails ;;
     ip-add-guide)          show_ip_add_guide ;;
