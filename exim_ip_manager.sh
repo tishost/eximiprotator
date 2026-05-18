@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.9.0
+#  Version : 1.9.1
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.9.0"
+VERSION="1.9.1"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -161,6 +161,32 @@ toggle_ip() {
     [[ "$apply" =~ ^[Yy]$ ]] && update_current_ip
 }
 
+edit_ip_limit() {
+    print_header
+    echo -e "${BLUE}=== Edit IP Hourly Limit ===${NC}\n"
+    list_ips_simple
+    echo ""
+    read -rp "Enter IP to edit: " ip
+
+    validate_ip "$ip" || { echo -e "${RED}Invalid IP.${NC}"; return 1; }
+    grep -q "^${ip}|" "$CONFIG_FILE" || { echo -e "${RED}IP not found.${NC}"; return 1; }
+
+    local current_limit
+    current_limit=$(grep "^${ip}|" "$CONFIG_FILE" | cut -d'|' -f3)
+    echo -e "Current limit: ${YELLOW}${current_limit}/hr${NC}"
+    read -rp "New hourly limit: " new_limit
+
+    [[ "$new_limit" =~ ^[0-9]+$ ]] || { echo -e "${RED}Invalid — must be a number.${NC}"; return 1; }
+
+    local escaped
+    escaped=$(escape_for_sed "$ip")
+    # Config format: IP|LABEL|LIMIT|ENABLED  — replace field 3
+    sed -i "s/^${escaped}|\([^|]*\)|[0-9]*|\([01]\)$/${ip}|\1|${new_limit}|\2/" "$CONFIG_FILE"
+
+    echo -e "${GREEN}✓ Limit updated: $ip → ${new_limit}/hr${NC}"
+    log "Limit updated: $ip new_limit=$new_limit"
+}
+
 list_ips_simple() {
     local active
     active=$(ip_count)
@@ -311,7 +337,7 @@ _update_cpanel_mailfiles() {
     local tmp_ips tmp_helo
     tmp_ips=$(mktemp)
     tmp_helo=$(mktemp)
-    trap 'rm -f "$tmp_ips" "$tmp_helo"' RETURN
+    trap 'rm -f "${tmp_ips:-}" "${tmp_helo:-}"' RETURN
 
     {
         echo "# Managed by eximip v${VERSION} — $(date)"
@@ -858,7 +884,7 @@ show_mail_stats() {
     # ── extract relevant lines once (performance) ───────────
     local tmpfile
     tmpfile=$(mktemp /tmp/exim_stats.XXXXXX)
-    trap 'rm -f "$tmpfile"' RETURN
+    trap 'rm -f "${tmpfile:-}"' RETURN
     grep -E "^(${date_pattern})" "$MAINLOG" > "$tmpfile" 2>/dev/null || true
 
     local total_queued total_delivered total_failed total_deferred
@@ -1938,6 +1964,7 @@ main_menu() {
         echo -e "  ${GREEN}a)${NC} Auto-sync — detect & add all server IPs"
         echo -e "  ${GREEN}3)${NC} Remove IP"
         echo -e "  ${GREEN}4)${NC} Enable / Disable IP"
+        echo -e "  ${GREEN}e)${NC} Edit IP hourly limit"
         echo -e "  ${GREEN}5)${NC} Update current sending IP now"
         if [[ -f "$PAUSE_FILE" ]]; then
             echo -e "  ${YELLOW}p)${NC} ${YELLOW}⏸  Resume rotation (currently PAUSED)${NC}"
@@ -1967,6 +1994,7 @@ main_menu() {
             a) sync_server_ips ;;
             3) remove_ip ;;
             4) toggle_ip ;;
+            e) edit_ip_limit ;;
             5) update_current_ip ;;
             p) manage_rotation_pause ;;
             6) show_status ;;
@@ -2001,6 +2029,7 @@ case "${1:-menu}" in
     list)          list_ips ;;
     status)        show_status ;;
     update-ip)        update_current_ip ;;
+    edit-limit)       edit_ip_limit ;;
     rotation-pause)   manage_rotation_pause ;;
     cron-rotate)      cron_rotate ;;
     blacklist)     check_blacklist ;;
