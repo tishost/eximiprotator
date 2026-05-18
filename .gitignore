@@ -1,0 +1,5 @@
+# runtime files — never commit these
+/etc/exim_rotation.conf
+/etc/exim_current_ip
+*.log
+*.tmp
