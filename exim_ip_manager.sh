@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.7.0
+#  Version : 1.8.0
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.7.0"
+VERSION="1.8.0"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -282,6 +282,7 @@ _update_cpanel_mailfiles() {
     local tmp_ips tmp_helo
     tmp_ips=$(mktemp)
     tmp_helo=$(mktemp)
+    trap 'rm -f "$tmp_ips" "$tmp_helo"' RETURN
 
     {
         echo "# Managed by eximip v${VERSION} — $(date)"
@@ -326,7 +327,7 @@ _update_cpanel_mailfiles() {
                 helo="${helo%%[[:space:]]*}"
                 [[ "$dom" == "*" || -z "$dom" || -z "$helo" ]] && continue
                 # Keep only if corresponding mailips entry is dedicated
-                if grep -qP "^${dom}: " "$tmp_ips" 2>/dev/null; then
+                if grep -qF "${dom}: " "$tmp_ips" 2>/dev/null; then
                     echo "${dom}: ${helo}"
                 fi
             done < "$MAILHELLO"
@@ -405,6 +406,9 @@ sync_server_ips() {
     local added=0 skipped=0
 
     for sip in "${server_ips[@]}"; do
+        # Sanity-check the IP string before writing it to the config
+        validate_ip "$sip" || continue
+
         # Already in config? Skip
         if grep -q "^${sip}|" "$CONFIG_FILE" 2>/dev/null; then
             skipped=$((skipped+1))
@@ -457,55 +461,55 @@ show_setup_guide() {
     print_header
     echo -e "${BLUE}=== WHM/cPanel Setup Guide ===${NC}\n"
 
-    echo -e "${CYAN}এই system দুটো পদ্ধতিতে IP rotation করে:${NC}"
+    echo -e "${CYAN}This system rotates IPs using two methods:${NC}"
     echo -e "  1. ${GREEN}/etc/mailips + /etc/mailhello${NC} — cPanel native (primary)"
-    echo -e "     প্রতি ঘণ্টায় সব domain এর outgoing IP আপডেট হয়"
-    echo -e "     কোনো WHM config change লাগে না\n"
-    echo -e "  2. ${GREEN}/etc/exim_current_ip${NC} — Exim transport readfile (backup)"
-    echo -e "     WHM এ একবার interface line যোগ করতে হয়\n"
+    echo -e "     Updates outgoing IP for all domains every hour."
+    echo -e "     No WHM config change required.\n"
+    echo -e "  2. ${GREEN}/etc/exim_current_ip${NC} — Exim transport readfile (optional fallback)"
+    echo -e "     Requires a one-time interface line in WHM Advanced Editor.\n"
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}REQUIRED — Cron install (সবার জন্য)${NC}"
+    echo -e "${YELLOW}REQUIRED — Install the hourly cron${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "  প্রতি ঘণ্টায় /etc/mailips ও /etc/mailhello আপডেট করে।"
+    echo -e "  Updates /etc/mailips and /etc/mailhello every hour."
     echo -e "  Run: ${GREEN}eximip install-cron${NC}\n"
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}OPTIONAL — WHM Exim transport (extra safety)${NC}"
+    echo -e "${YELLOW}OPTIONAL — WHM Exim transport interface line${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "  এটা না করলেও চলবে। করলে fallback হিসেবে কাজ করে।\n"
+    echo -e "  Not required, but adds a fallback for Exim to honour the IP file.\n"
     echo -e "  1. WHM → Service Configuration → Exim Configuration Manager"
     echo -e "     → Advanced Editor\n"
-    echo -e "  2. ${CYAN}remote_smtp:${NC} transport খোঁজো\n"
-    echo -e "  3. ${CYAN}driver = smtp${NC} এর নিচে এই line যোগ করো:"
+    echo -e "  2. Find the ${CYAN}remote_smtp:${NC} transport section\n"
+    echo -e "  3. Add this line below ${CYAN}driver = smtp${NC}:"
     echo -e "     ${GREEN}  interface = \${readfile{/etc/exim_current_ip}{}}${NC}\n"
-    echo -e "  4. Save → WHM automatically rebuild + restart করবে\n"
+    echo -e "  4. Save — WHM will rebuild and restart Exim automatically.\n"
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}cPanel /etc/mailips কীভাবে কাজ করে${NC}"
+    echo -e "${YELLOW}How /etc/mailips works${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     cat << 'INFO'
 
-  /etc/mailips  → domain: IP       (কোন domain কোন IP থেকে mail পাঠাবে)
-  /etc/mailhello → domain: hostname (SMTP EHLO/HELO hostname)
+  /etc/mailips   → domain: IP        (which IP each domain sends from)
+  /etc/mailhello → domain: hostname  (SMTP EHLO/HELO hostname per domain)
 
-  Entry না থাকলে → cPanel main server IP থেকে mail যায়।
-  Entry থাকলে   → সেই নির্দিষ্ট IP থেকে mail যায়।
+  If no entry exists  → cPanel uses the main server IP.
+  If an entry exists  → mail goes out from that specific IP.
 
-  এই system প্রতি ঘণ্টায় এই দুটো file আপডেট করে:
-  • সব cPanel domain → rotation এর current IP
-  • Dedicated IP থাকা domains → touch করা হয় না
+  This system updates both files every hour:
+  • All cPanel domains  → current rotation IP (via wildcard *)
+  • Domains with a dedicated IP  → left untouched
 
 INFO
-    echo -e "  ${CYAN}verify করতে:${NC}"
-    echo -e "  cat /etc/mailips   → সব domain এর IP দেখাবে"
-    echo -e "  cat /etc/mailhello → সব domain এর HELO দেখাবে\n"
+    echo -e "  ${CYAN}To verify:${NC}"
+    echo -e "  cat /etc/mailips   → shows the current outgoing IP"
+    echo -e "  cat /etc/mailhello → shows the current HELO hostname\n"
 
-    echo -e "${GREEN}Setup শেষ করতে:${NC}"
-    echo -e "  1. ${YELLOW}eximip sync${NC}         ← server IPs auto-detect"
-    echo -e "  2. ${YELLOW}eximip install-cron${NC} ← hourly rotation চালু করো"
-    echo -e "  3. ${YELLOW}eximip update-ip${NC}    ← এখনই apply করো"
-    echo -e "  4. ${YELLOW}eximip ip-check${NC}     ← সব IP verify করো\n"
+    echo -e "${GREEN}To finish setup:${NC}"
+    echo -e "  1. ${YELLOW}eximip sync${NC}         ← auto-detect all server IPs"
+    echo -e "  2. ${YELLOW}eximip install-cron${NC} ← enable hourly rotation"
+    echo -e "  3. ${YELLOW}eximip update-ip${NC}    ← apply immediately"
+    echo -e "  4. ${YELLOW}eximip ip-check${NC}     ← verify all IPs\n"
 }
 
 # ── cron installer ───────────────────────────────────────────
@@ -541,23 +545,23 @@ remove_cron() {
 uninstall() {
     print_header
     echo -e "${RED}=== Uninstall Exim IP Rotation Manager ===${NC}\n"
-    echo -e "এই কাজগুলো হবে:\n"
-    echo -e "  ${RED}✗${NC} Exim config থেকে interface line সরানো হবে"
-    echo -e "  ${RED}✗${NC} Exim rebuild ও restart হবে (mail চলতে থাকবে — main IP এ)"
-    echo -e "  ${RED}✗${NC} Hourly cron বন্ধ হবে"
-    echo -e "  ${RED}✗${NC} /etc/exim_current_ip মুছে যাবে"
-    echo -e "  ${RED}✗${NC} /usr/local/bin/eximip মুছে যাবে"
-    echo -e "  ${RED}✗${NC} /usr/local/eximiprotator/ মুছে যাবে"
-    echo -e "  ${YELLOW}✓${NC} /etc/exim_rotation.conf রাখা হবে (IP list backup)"
-    echo -e "  ${YELLOW}✓${NC} /var/log/exim_ip_rotation.log রাখা হবে\n"
+    echo -e "The following actions will be performed:\n"
+    echo -e "  ${RED}✗${NC} Remove interface line from Exim config"
+    echo -e "  ${RED}✗${NC} Rebuild and restart Exim (mail continues via main IP)"
+    echo -e "  ${RED}✗${NC} Remove hourly cron job"
+    echo -e "  ${RED}✗${NC} Remove /etc/exim_current_ip"
+    echo -e "  ${RED}✗${NC} Remove /usr/local/bin/eximip"
+    echo -e "  ${RED}✗${NC} Remove /usr/local/eximiprotator/"
+    echo -e "  ${YELLOW}✓${NC} /etc/exim_rotation.conf kept (IP list backup)"
+    echo -e "  ${YELLOW}✓${NC} /var/log/exim_ip_rotation.log kept\n"
 
-    read -rp "$(echo -e "${RED}নিশ্চিত? এটা undo করা যাবে না। [yes/N]: ${NC}")" confirm
+    read -rp "$(echo -e "${RED}Confirm? This cannot be undone. Type yes to proceed [yes/N]: ${NC}")" confirm
     [[ "$confirm" != "yes" ]] && echo -e "${YELLOW}Cancelled.${NC}" && return 0
 
     echo ""
 
-    # ── Step 1: Exim config থেকে interface line সরাও ──────────
-    echo -e "${YELLOW}[1/5] Exim config থেকে interface line সরাচ্ছি...${NC}"
+    # ── Step 1: Remove interface line from Exim config ─────────
+    echo -e "${YELLOW}[1/5] Removing interface line from Exim config...${NC}"
 
     local EXIM_CONF="/etc/exim.conf"
     local removed_exim=0
@@ -586,12 +590,12 @@ uninstall() {
     if [[ $removed_exim -eq 0 ]]; then
         echo -e "  ${YELLOW}⚠ interface line not found automatically.${NC}"
         echo -e "  ${YELLOW}  WHM → Exim Configuration Manager → Advanced Editor${NC}"
-        echo -e "  ${YELLOW}  remote_smtp transport থেকে এই line টা manually সরাও:${NC}"
+        echo -e "  ${YELLOW}  Manually remove this line from the remote_smtp transport:${NC}"
         echo -e "  ${RED}    interface = \${readfile{/etc/exim_current_ip}{}}${NC}"
     fi
 
     # ── Step 2: Exim rebuild + restart ─────────────────────────
-    echo -e "${YELLOW}[2/5] Exim rebuild ও restart করছি...${NC}"
+    echo -e "${YELLOW}[2/5] Rebuilding and restarting Exim...${NC}"
 
     if command -v /scripts/buildeximconf &>/dev/null; then
         /scripts/buildeximconf > /dev/null 2>&1 && \
@@ -607,22 +611,21 @@ uninstall() {
             echo -e "  ${YELLOW}⚠ Could not restart Exim — run manually: service exim restart${NC}"
     fi
 
-    # ── Step 3: Cron সরাও ──────────────────────────────────────
-    echo -e "${YELLOW}[3/5] Cron সরাচ্ছি...${NC}"
+    # ── Step 3: Remove cron ────────────────────────────────────
+    echo -e "${YELLOW}[3/5] Removing cron job...${NC}"
     crontab -l 2>/dev/null | grep -v "exim_ip_manager" | crontab - || true
     echo -e "  ${GREEN}✓ Cron removed${NC}"
 
-    # logrotate সরাও
     rm -f /etc/logrotate.d/exim-ip-rotation
     echo -e "  ${GREEN}✓ Logrotate config removed${NC}"
 
-    # ── Step 4: Runtime files সরাও ────────────────────────────
-    echo -e "${YELLOW}[4/5] Runtime files সরাচ্ছি...${NC}"
+    # ── Step 4: Remove runtime files ──────────────────────────
+    echo -e "${YELLOW}[4/5] Removing runtime files...${NC}"
     rm -f "$CURRENT_IP_FILE" && echo -e "  ${GREEN}✓ /etc/exim_current_ip removed${NC}"
     rm -f /usr/local/bin/eximip && echo -e "  ${GREEN}✓ /usr/local/bin/eximip removed${NC}"
 
-    # ── Step 5: Install directory সরাও ────────────────────────
-    echo -e "${YELLOW}[5/5] Install directory সরাচ্ছি...${NC}"
+    # ── Step 5: Remove install directory ──────────────────────
+    echo -e "${YELLOW}[5/5] Removing install directory...${NC}"
     local install_dirs=("/usr/local/eximiprotator" "/usr/local/exim-ip-manager")
     for d in "${install_dirs[@]}"; do
         if [[ -d "$d" ]]; then
@@ -636,14 +639,14 @@ uninstall() {
     echo -e "${CYAN}══════════════════════════════════════════════${NC}"
     echo -e "${GREEN}  Uninstall complete.${NC}"
     echo -e "${CYAN}══════════════════════════════════════════════${NC}"
-    echo -e "  Mail এখন main server IP থেকে যাবে (Exim default)।"
-    echo -e "  IP list backup: ${YELLOW}/etc/exim_rotation.conf${NC}"
-    echo -e "  Exim config backup: ${YELLOW}${EXIM_CONF}.pre-eximip-uninstall.*${NC}"
+    echo -e "  Mail now routes via the main server IP (Exim default)."
+    echo -e "  IP list backup : ${YELLOW}/etc/exim_rotation.conf${NC}"
+    echo -e "  Exim config backup : ${YELLOW}${EXIM_CONF}.pre-eximip-uninstall.*${NC}"
 
     if [[ $removed_exim -eq 0 ]]; then
         echo ""
-        echo -e "  ${RED}⚠ WHM Advanced Editor থেকে interface line manually সরাও!${NC}"
-        echo -e "  ${RED}  না সরালে Exim /etc/exim_current_ip খুঁজবে — mail যাবে না।${NC}"
+        echo -e "  ${RED}⚠ Manually remove the interface line from WHM Advanced Editor!${NC}"
+        echo -e "  ${RED}  Without this, Exim will look for /etc/exim_current_ip and mail will fail.${NC}"
     fi
     echo ""
 }
@@ -663,10 +666,10 @@ show_status() {
         local pinned_ip
         pinned_ip=$(tr -d '[:space:]' < "$PAUSE_FILE")
         echo -e "${YELLOW}⏸  ROTATION PAUSED — pinned IP: ${GREEN}${pinned_ip}${YELLOW}${NC}"
-        echo -e "${YELLOW}   Hourly cron চলছে কিন্তু IP switch হবে না।${NC}"
-        echo -e "${YELLOW}   Resume করতে: eximip rotation-pause${NC}\n"
+        echo -e "${YELLOW}   Hourly cron is running but will NOT switch IPs.${NC}"
+        echo -e "${YELLOW}   To resume: eximip rotation-pause${NC}\n"
     else
-        echo -e "${GREEN}▶  ROTATION ACTIVE — hourly auto-switch চলছে${NC}\n"
+        echo -e "${GREEN}▶  ROTATION ACTIVE — hourly auto-switch is running${NC}\n"
     fi
 
     echo -e "Server time   : $(date)"
@@ -824,6 +827,7 @@ show_mail_stats() {
     # ── extract relevant lines once (performance) ───────────
     local tmpfile
     tmpfile=$(mktemp /tmp/exim_stats.XXXXXX)
+    trap 'rm -f "$tmpfile"' RETURN
     grep -E "^(${date_pattern})" "$MAINLOG" > "$tmpfile" 2>/dev/null || true
 
     local total_queued total_delivered total_failed total_deferred
@@ -1015,7 +1019,6 @@ show_mail_stats() {
         echo ""
     fi
 
-    rm -f "$tmpfile"
     log "Stats viewed: days=$days delivered=$total_delivered failed=$total_failed"
 }
 
@@ -1660,107 +1663,106 @@ show_ip_add_guide() {
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     cat << 'GUIDE'
 
-  [ ] 1. Hosting panel (Hetzner/OVH/Vultr/Linode etc.) থেকে
-         নতুন IP টা server এ assign করো।
-         → এটা না করলে WHM তে IP add করলেও কাজ করবে না।
+  [ ] 1. Assign the new IP to your server in your hosting panel
+         (Hetzner / OVH / Vultr / Linode / etc.)
+         → Without this step, adding the IP in WHM will not work.
 
-  [ ] 2. Reverse DNS (PTR) সেট করো hosting panel থেকে:
-         IP → mail.yourdomain.com
-         (এটা পরে করলেও হয়, কিন্তু আগে করলে ভালো)
+  [ ] 2. Set Reverse DNS (PTR) in your hosting panel:
+         NEW_IP → mail.yourdomain.com
+         (Can be done later, but better to do it first.)
 
-  [ ] 3. IP টা ping করো নিশ্চিত হতে:
+  [ ] 3. Verify the IP is reachable:
          ping -c 3 <new-ip>
-         → response না পেলে server এ assigned হয়নি
+         → No response means it is not yet assigned on the server.
 
 GUIDE
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}PHASE 2 — WHM এ IP যোগ করো (downtime নেই)${NC}"
+    echo -e "${YELLOW}PHASE 2 — Add the IP in WHM (no downtime)${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     cat << 'GUIDE'
 
   [ ] 1. WHM → IP Functions → Add a New IP Address
 
-  [ ] 2. Fields:
+  [ ] 2. Fill in the fields:
          • New IP or IP range : <your-new-ip>
-         • Subnet Mask        : 255.255.255.0  (বা provider যা দিয়েছে)
-         • Assign to ethernet : eth0  (অথবা server এর interface নাম)
+         • Subnet Mask        : 255.255.255.0  (or whatever your provider gave)
+         • Assign to ethernet : eth0  (or your server's actual interface name)
 
-         ⚠ "Assign to Ethernet Device" — eth0 এর জায়গায়
-           তোমার server এর সঠিক interface দাও।
-           দেখতে: ip addr | grep -E 'eth|ens|bond'
+         ⚠ To find your interface name run:
+           ip addr | grep -E 'eth|ens|bond'
 
-  [ ] 3. Submit করো।
+  [ ] 3. Click Submit.
 
-  [ ] 4. Verify করো — WHM → IP Functions → Show IP Address Usage
-         নতুন IP দেখাচ্ছে কিনা এবং "Unassigned" আছে কিনা।
+  [ ] 4. Verify: WHM → IP Functions → Show IP Address Usage
+         The new IP should appear as "Unassigned".
 
-  ✓ এই পর্যন্ত কোনো existing account বা mail এ কোনো প্রভাব পড়েনি।
-
-GUIDE
-
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}PHASE 3 — IP কে "Unassigned" রাখো (critical)${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    cat << 'GUIDE'
-
-  ⚠ IMPORTANT: নতুন IP কে কোনো cPanel account এ assign করো না।
-    Rotation এর জন্য IP শুধু Exim outgoing interface এ use হবে।
-    কোনো account এ assign করলে সেই account এর website/mail
-    নতুন IP তে চলে যাবে — বিপদ।
-
-  ✓ WHM → Show IP Address Usage → নতুন IP "Unassigned" থাকুক।
+  ✓ No existing accounts or mail flows are affected up to this point.
 
 GUIDE
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}PHASE 4 — DNS records (mail delivery এর জন্য required)${NC}"
+    echo -e "${YELLOW}PHASE 3 — Keep the IP \"Unassigned\" (critical)${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     cat << 'GUIDE'
 
-  [ ] 1. SPF record আপডেট করো — নতুন IP যোগ করো:
+  ⚠ IMPORTANT: Do NOT assign the new IP to any cPanel account.
+    This IP is used only as an Exim outgoing interface for rotation.
+    If you assign it to an account, that account's website and mail
+    will move to the new IP — this will break things.
+
+  ✓ WHM → Show IP Address Usage → new IP must remain "Unassigned".
+
+GUIDE
+
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${YELLOW}PHASE 4 — DNS records (required for mail delivery)${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    cat << 'GUIDE'
+
+  [ ] 1. Update your SPF record to include the new IP:
          yourdomain.com  TXT  "v=spf1 ip4:OLD_IP ip4:NEW_IP ~all"
 
-  [ ] 2. PTR (rDNS) — hosting panel এ:
+  [ ] 2. Set PTR (rDNS) in your hosting panel:
          NEW_IP → mail.yourdomain.com
 
-  [ ] 3. Forward-confirmed rDNS verify করো (PTR add করার পর):
+  [ ] 3. Verify forward-confirmed rDNS after the PTR propagates:
          dig +short -x NEW_IP
          dig +short A mail.yourdomain.com
-         → দুটো একই IP দেখাবে
+         → Both should return the same IP.
 
-  [ ] 4. DKIM — নতুন IP এর জন্য আলাদা DKIM লাগে না।
-         একটা domain এর একটা DKIM key সব IP cover করে।
+  [ ] 4. DKIM — no separate DKIM key is needed per IP.
+         One DKIM key per domain covers all sending IPs.
 
 GUIDE
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}PHASE 5 — Exim এ যোগ করো (একবারই করতে হয়)${NC}"
+    echo -e "${YELLOW}PHASE 5 — Register in eximip (one-time setup done already)${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     cat << 'GUIDE'
 
-  প্রথমবার setup (setup-guide দেখো):
+  First-time setup (see: eximip setup-guide):
   [ ] WHM → Exim Configuration Manager → Advanced Editor
-  [ ] remote_smtp transport এ যোগ করো:
+  [ ] Add to remote_smtp transport:
         interface = ${readfile{/etc/exim_current_ip}{}}
-  [ ] Save → WHM automatically rebuild + restart করবে
+  [ ] Save — WHM will rebuild and restart Exim automatically.
 
-  নতুন IP প্রতিবার:
-  [ ] eximip add       → IP ও label দাও
-  [ ] eximip update-ip → এখনই rotation এ নাও
+  For each new IP after that:
+  [ ] eximip add       → enter IP and label
+  [ ] eximip update-ip → apply to rotation immediately
 
-  ✓ Exim restart লাগে না।
-  ✓ Existing mail delivery বাধাগ্রস্ত হয় না।
+  ✓ No Exim restart needed.
+  ✓ Existing mail delivery is not interrupted.
 
 GUIDE
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}PHASE 6 — IP Warm-up (নতুন IP এর জন্য mandatory)${NC}"
+    echo -e "${YELLOW}PHASE 6 — IP Warm-up (mandatory for new IPs)${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     cat << 'GUIDE'
 
-  নতুন IP থেকে হঠাৎ বেশি mail পাঠালে blacklist হয়।
-  Gmail/Yahoo নতুন IP কে বিশ্বাস করে না।
+  Sending too much mail from a new IP immediately will get it blacklisted.
+  Gmail and Yahoo do not trust brand-new IPs.
 
   Recommended warm-up schedule:
   ┌─────────┬────────────────────────────────────┐
@@ -1771,37 +1773,37 @@ GUIDE
   │ Week 4+ │ normal volume                      │
   └─────────┴────────────────────────────────────┘
 
-  eximip add করার সময় hourly limit কম দাও (প্রথম সপ্তাহে 50–100)।
-  পরে eximip remove → re-add দিয়ে limit বাড়াও।
+  Set a low hourly limit when running eximip add (50–100 for week 1).
+  Increase later by removing and re-adding the IP with a higher limit.
 
 GUIDE
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}সতর্কতা — এগুলো কখনো করবে না${NC}"
+    echo -e "${YELLOW}Warnings — never do these${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     cat << 'GUIDE'
 
-  ✗ নতুন IP কে main server IP বানাবে না
-  ✗ নতুন IP কে কোনো cPanel account এ assign করবে না
-  ✗ SPF ছাড়া IP rotation চালু করবে না
-  ✗ PTR ছাড়া mail পাঠাবে না (Gmail reject করে)
-  ✗ Warm-up ছাড়া নতুন IP থেকে bulk mail দেবে না
-  ✗ Exim config manually edit করবে না WHM rebuild এর পরে
+  ✗ Do not make the new IP your main server IP
+  ✗ Do not assign the new IP to any cPanel account
+  ✗ Do not start IP rotation without a valid SPF record
+  ✗ Do not send mail without PTR set (Gmail will reject it)
+  ✗ Do not send bulk mail from a new IP before warm-up
+  ✗ Do not manually edit Exim config after a WHM rebuild
 
 GUIDE
 
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${YELLOW}Quick checklist — IP add এর আগে${NC}"
+    echo -e "${YELLOW}Quick pre-flight checklist${NC}"
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo -e "  Run করো: ${GREEN}eximip deliverability-fails${NC}"
-    echo -e "  → বর্তমান সমস্যা দেখাবে, আগে ঠিক করো"
+    echo -e "  Run: ${GREEN}eximip deliverability-fails${NC}"
+    echo -e "  → Shows current issues — fix these before adding a new IP."
     echo ""
-    echo -e "  Run করো: ${GREEN}eximip blacklist${NC}"
-    echo -e "  → নতুন IP blacklist এ আছে কিনা দেখো"
+    echo -e "  Run: ${GREEN}eximip blacklist${NC}"
+    echo -e "  → Check whether the new IP is already on a blacklist."
     echo ""
-    echo -e "  Run করো: ${GREEN}eximip add${NC}"
-    echo -e "  → IP যোগ করো"
+    echo -e "  Run: ${GREEN}eximip add${NC}"
+    echo -e "  → Add the IP to the rotation pool."
     echo ""
 }
 
@@ -1828,7 +1830,7 @@ _select_pin_ip() {
     done < <(get_ips)
 
     echo ""
-    read -rp "IP number নির্বাচন করো (1-${#ip_array[@]}): " sel
+    read -rp "Select IP number (1-${#ip_array[@]}): " sel
 
     if [[ "$sel" =~ ^[0-9]+$ ]] && \
        [[ $sel -ge 1 ]] && [[ $sel -le ${#ip_array[@]} ]]; then
@@ -1836,7 +1838,7 @@ _select_pin_ip() {
         echo -n "$chosen_ip" > "$PAUSE_FILE"
         _apply_ip "$chosen_ip"
         echo -e "\n${GREEN}✓ Rotation paused. Sending from: ${chosen_ip}${NC}"
-        echo -e "${YELLOW}  Resume করতে menu → p  অথবা: eximip rotation-pause${NC}"
+        echo -e "${YELLOW}  To resume: menu → p  or: eximip rotation-pause${NC}"
         log "Rotation paused, pinned IP: $chosen_ip"
     else
         echo -e "${RED}Invalid selection — rotation unchanged.${NC}"
@@ -1853,10 +1855,10 @@ manage_rotation_pause() {
 
         echo -e "${YELLOW}⏸  Rotation is currently PAUSED${NC}"
         echo -e "   Pinned IP : ${GREEN}${pinned_ip}${NC}"
-        echo -e "   Cron প্রতি ঘণ্টায় চললেও IP switch হবে না।\n"
+        echo -e "   Hourly cron is running but will NOT switch IPs.\n"
 
-        echo -e "  ${GREEN}1)${NC} Resume rotation (auto-rotate চালু করো)"
-        echo -e "  ${GREEN}2)${NC} Change pinned IP (অন্য IP pin করো)"
+        echo -e "  ${GREEN}1)${NC} Resume rotation (re-enable hourly auto-switch)"
+        echo -e "  ${GREEN}2)${NC} Change pinned IP (pin a different IP)"
         echo -e "  ${RED}0)${NC} Cancel"
         echo ""
         read -rp "Select: " choice
@@ -1877,11 +1879,11 @@ manage_rotation_pause() {
         esac
     else
         echo -e "${GREEN}▶  Rotation is currently ACTIVE${NC}"
-        echo -e "   প্রতি ঘণ্টায় IP স্বয়ংক্রিয়ভাবে switch হচ্ছে।\n"
-        echo -e "Pause করলে hourly cron IP বদলাবে না।"
-        echo -e "তুমি যে IP দেবে শুধু সেটা থেকে mail যাবে।\n"
+        echo -e "   IPs are switching automatically every hour.\n"
+        echo -e "Pausing stops the hourly cron from switching IPs."
+        echo -e "All mail will go out from whichever IP you pin.\n"
 
-        echo -e "  ${GREEN}1)${NC} Pause rotation — একটা IP fix করো"
+        echo -e "  ${GREEN}1)${NC} Pause rotation — fix a specific sending IP"
         echo -e "  ${RED}0)${NC} Cancel"
         echo ""
         read -rp "Select: " choice
