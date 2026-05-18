@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.6.0
+#  Version : 1.6.1
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.6.0"
+VERSION="1.6.1"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -250,9 +250,9 @@ update_current_ip() {
 }
 
 # Updates /etc/mailips and /etc/mailhello using wildcard catch-all.
-# Format:
-#   dedicated.com=2.2.2.2   ← preserved (non-rotation dedicated IP)
-#   *=1.1.1.1               ← catch-all for every other domain
+# cPanel format: "domain: value"  (colon + space — NOT equals sign)
+#   dedicated.com: 2.2.2.2   ← preserved (non-rotation dedicated IP)
+#   *: 1.1.1.1               ← catch-all for every other domain
 #
 # cPanel Exim uses lsearch*@ which matches wildcard entries,
 # so explicit domain entries take precedence over *.
@@ -283,38 +283,50 @@ _update_cpanel_mailfiles() {
         echo ""
 
         # Preserve dedicated IP entries (IPs NOT in our rotation pool)
+        # Format: "domain: ip"  — split on ": "
         if [[ -f "$MAILIPS" ]]; then
-            while IFS='=' read -r dom ip; do
-                [[ -z "$dom" || "$dom" == \#* || "$dom" == "*" ]] && continue
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                local dom ip
+                dom="${line%%:*}"
+                dom="${dom%%[[:space:]]*}"
+                ip="${line#*: }"
                 ip="${ip%%[[:space:]]*}"
+                [[ "$dom" == "*" || -z "$dom" || -z "$ip" ]] && continue
                 # Keep only if IP is NOT one of our rotation IPs
                 if ! grep -q "^${ip}|" "$CONFIG_FILE" 2>/dev/null; then
-                    echo "${dom}=${ip}"
+                    echo "${dom}: ${ip}"
                 fi
             done < "$MAILIPS"
         fi
 
         # Wildcard catch-all
-        echo "*=${new_ip}"
+        echo "*: ${new_ip}"
     } > "$tmp_ips"
 
     {
         echo "# Managed by eximip v${VERSION} — $(date)"
         echo ""
 
-        # Preserve dedicated HELO entries
+        # Preserve dedicated HELO entries whose domain still has a dedicated mailips entry
         if [[ -f "$MAILHELLO" ]]; then
-            while IFS='=' read -r dom helo; do
-                [[ -z "$dom" || "$dom" == \#* || "$dom" == "*" ]] && continue
+            while IFS= read -r line; do
+                [[ -z "$line" || "$line" == \#* ]] && continue
+                local dom helo
+                dom="${line%%:*}"
+                dom="${dom%%[[:space:]]*}"
+                helo="${line#*: }"
+                helo="${helo%%[[:space:]]*}"
+                [[ "$dom" == "*" || -z "$dom" || -z "$helo" ]] && continue
                 # Keep only if corresponding mailips entry is dedicated
-                if grep -qP "^${dom}=" "$tmp_ips" 2>/dev/null; then
-                    echo "${dom}=${helo}"
+                if grep -qP "^${dom}: " "$tmp_ips" 2>/dev/null; then
+                    echo "${dom}: ${helo}"
                 fi
             done < "$MAILHELLO"
         fi
 
         # Wildcard catch-all
-        [[ -n "$new_helo" ]] && echo "*=${new_helo}"
+        [[ -n "$new_helo" ]] && echo "*: ${new_helo}"
     } > "$tmp_helo"
 
     # Atomic replace
@@ -323,10 +335,10 @@ _update_cpanel_mailfiles() {
     mv "$tmp_helo" "$MAILHELLO"
 
     [[ "$silent" != "silent" ]] && \
-        echo -e "${GREEN}✓ /etc/mailips   : *=${new_ip}${NC}" && \
-        echo -e "${GREEN}✓ /etc/mailhello : *=${new_helo:-$new_ip}${NC}"
+        echo -e "${GREEN}✓ /etc/mailips   : *: ${new_ip}${NC}" && \
+        echo -e "${GREEN}✓ /etc/mailhello : *: ${new_helo:-$new_ip}${NC}"
 
-    log "mailips/mailhello updated: *=$new_ip helo=$new_helo"
+    log "mailips/mailhello updated: *: $new_ip helo=$new_helo"
 }
 
 # Called by cron every hour — auto-sync then rotate
@@ -452,8 +464,8 @@ show_setup_guide() {
     echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     cat << 'INFO'
 
-  /etc/mailips  → domain=IP   (কোন domain কোন IP থেকে mail পাঠাবে)
-  /etc/mailhello → domain=hostname (SMTP EHLO/HELO hostname)
+  /etc/mailips  → domain: IP       (কোন domain কোন IP থেকে mail পাঠাবে)
+  /etc/mailhello → domain: hostname (SMTP EHLO/HELO hostname)
 
   Entry না থাকলে → cPanel main server IP থেকে mail যায়।
   Entry থাকলে   → সেই নির্দিষ্ট IP থেকে mail যায়।
