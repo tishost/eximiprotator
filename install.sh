@@ -85,9 +85,9 @@ if [[ ! -f /etc/exim_rotation.conf ]] || \
 fi
 
 echo -e "${CYAN}Next steps:${NC}"
-echo -e "  1. ${YELLOW}eximip setup-guide${NC}   ← WHM এ একবারের setup দেখো"
-echo -e "  2. ${YELLOW}eximip list${NC}           ← Auto-detected IPs দেখো"
-echo -e "  3. ${YELLOW}eximip install-cron${NC}   ← Hourly rotation চালু করো"
+echo -e "  1. ${YELLOW}eximip setup-guide${NC}   ← Read the WHM setup guide first"
+echo -e "  2. ${YELLOW}eximip list${NC}           ← View auto-detected IPs"
+echo -e "  3. ${YELLOW}eximip install-cron${NC}   ← Enable hourly rotation"
 echo ""
 echo -e "  Full guide : ${CYAN}${INSTALL_DIR}/USERGUIDE.md${NC}"
 echo -e "  GitHub     : ${CYAN}https://github.com/tishost/eximiprotator${NC}"

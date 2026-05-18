@@ -1,12 +1,12 @@
 #!/bin/bash
 # ============================================================
 #  Exim IP Rotation Manager for WHM/cPanel
-#  Version : 1.8.0
+#  Version : 1.8.1
 #  Requires root. Usage: bash exim_ip_manager.sh [command]
 # ============================================================
 set -euo pipefail
 
-VERSION="1.8.0"
+VERSION="1.8.1"
 
 CONFIG_FILE="/etc/exim_rotation.conf"
 CURRENT_IP_FILE="/etc/exim_current_ip"
@@ -872,8 +872,9 @@ show_mail_stats() {
     echo "  ──────────────────────────────────────────────"
 
     # Extract cPanel username from A=dovecot_plain:user or A=login:user or U=user
+    # \K resets match start — avoids variable-length lookbehind (not supported in PCRE)
     grep ' <= ' "$tmpfile" \
-        | grep -oP '(?<=(A=dovecot_plain:|A=login:|A=plain:|U=))[a-zA-Z0-9_.-]+' \
+        | grep -oP '(A=dovecot_plain:|A=login:|A=plain:|U=)\K[a-zA-Z0-9_.-]+' \
         | sort | uniq -c | sort -rn | head -20 \
         | while read -r count user; do
             printf "  %-20s  ${GREEN}%s${NC}\n" "$user" "$count"
